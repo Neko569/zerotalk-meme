@@ -57,10 +57,32 @@
     width: 34px; height: 34px; border-radius: 10px; border: 1px solid #d9dce1;
     background: #fff; font-size: 17px; line-height: 1; cursor: pointer;
   }
+  /* 输入区那一行：脚本找「官方上传入口」时会优先认 .composer-row / .input-card 里的
+     <input type=file>，所以桩里必须把这两个类名摆成真实站点的样子。 */
+  .composer-row { width: 100%; }
+  .input-card {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+    border: 1px solid #e5e7eb; border-radius: 14px; background: #fff;
+  }
+  @media (prefers-color-scheme: dark) { .input-card { background: #1c1d21; border-color: #33363d; } }
+  .input-card textarea {
+    flex: 1 1 auto; min-width: 0; resize: none; border: none; outline: none;
+    background: transparent; font: inherit; color: inherit; height: 20px;
+  }
+  .composer-img {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 8px; cursor: pointer;
+    border: 1px solid #d9dce1; background: #fff; font-size: 15px;
+  }
+  @media (prefers-color-scheme: dark) { .composer-img { background: #26282d; border-color: #3a3d44; } }
+  .composer-img input[type=file] { display: none; }
+  /* 宽度跟真实站点一致：站点是 .chat-input-dock{position:fixed;left:0;right:0} +
+     .input-card 没有 max-width，所以面板宽度**跟着视口走**。桩里不写死宽度，
+     才能真正复现「面板越宽格子越大」这个行为（拖浏览器窗口就能看出来）。 */
   .composer-emoji-panel {
-    width: 340px; height: 320px; padding: 8px; background: #fff;
+    width: 100%; height: 320px; padding: 8px; background: #fff;
     border: 1px solid #e5e7eb; border-radius: 14px; box-shadow: 0 8px 24px #0f172a1f;
-    display: none; flex-direction: column; overflow: hidden;
+    display: none; flex-direction: column; overflow: hidden; box-sizing: border-box;
   }
   .composer-emoji-panel--open { display: flex; }
   .composer-emoji-panel__slide, .composer-emoji-panel__body {
@@ -101,14 +123,14 @@
 <body>
 <div class="page">
   <h1>零语表情包助手 · 离线联调预览</h1>
-  <div class="sub">不连真实站点，用桩件（stub）跑通「搜索 → 下载 → presign → PUT → bind → WebSocket」全链路，用来核对请求是否与抓包一致。</div>
+  <div class="sub">不连真实站点，用桩件（stub）跑通「搜索 → 下载 → 上传 → 发送」全链路。默认走<b>官方通道</b>（把图交给 composer 的 file input，站点自己上传）；设置里切成「只用直连链路」才由脚本自己 presign → PUT → bind → WebSocket。</div>
 
   <div class="card">
     <h2>怎么用 <span class="pill">3 步</span></h2>
     <ol>
       <li>点下面模拟聊天区的 😊 按钮展开表情面板，切到第三个 <b>梗图</b> 栏。</li>
       <li>输入任意关键词（如 <b>哈哈</b>）→ 搜索 → 点一张图选中 → 发送。</li>
-      <li>滚到本页下方看 <b>请求日志</b>，逐条对照 <code>PROTOCOL.md</code> 里的抓包格式。</li>
+      <li>滚到本页下方看 <b>请求日志</b>：默认应出现 <code>[官方上传器]</code> 前缀的条目（站点的链路）；在设置里切成「只用直连链路」后，才会出现 <code>POST …/api/upload/presign</code> 这类脚本自己发的请求。</li>
     </ol>
     <div class="row">
       <button id="btn-copy">复制请求日志</button>
@@ -135,14 +157,29 @@
                     <div class="emoji-ui"><div class="emoji-scroll zx-ph">（桩：原生 Emoji 栏）</div></div>
                   </div>
                   <div class="emoji-swap__pane" role="tabpanel" inert>
-                    <div class="sticker-ui"><div class="emoji-scroll zx-ph">（桩：原生表情包栏）</div></div>
+                    <div class="sticker-ui">
+                      <div class="emoji-scroll zx-ph">（桩：原生表情包栏）</div>
+                      <!-- 诱饵 1：表情包栏的上传框是「收藏表情」用的，不是发图，
+                           脚本必须跳过它（accept 也收 jpeg，所以只靠 accept 分不出来）。 -->
+                      <input class="sticker-ui__file" type="file" accept="image/jpeg,image/png" hidden>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
           </div>
         </div>
-        <button class="composer-tool" type="button" aria-label="表情">😊</button>
+        <div class="composer-row">
+          <div class="input-card">
+            <textarea rows="1" placeholder="说点什么…"></textarea>
+            <label class="composer-img" title="发送图片">🖼
+              <!-- 站点自己的「发图」入口。脚本把图片塞进这里并派发 change，
+                   然后就交给官方上传链路（见 preview.html 末尾的桩监听）。 -->
+              <input id="zx-composer-file" type="file" accept="image/jpeg,image/png,image/webp">
+            </label>
+            <button class="composer-tool" type="button" aria-label="表情">😊</button>
+          </div>
+        </div>
       </div>
     </div>
     <div class="row"><span class="sub" style="margin:0">点 <b>😊</b> 收起/展开面板；点第三个 <b>梗图</b> 栏试试搜索。</span></div>
@@ -151,6 +188,9 @@
   <div class="card">
     <h2>请求日志 <span class="pill" id="req-count">0</span></h2>
     <pre id="zx-log">等待操作…</pre>
+    <!-- 诱饵 2：页面级的换头像入口（不在 composer 行内）。脚本的兜底档只认
+         composer 行内的输入框，所以它绝不该被选中 —— 见 preview-verify 的选择器断言。 -->
+    <input id="zx-decoy-avatar" type="file" accept="image/*" hidden>
   </div>
 
   <div class="card warn">
@@ -158,6 +198,7 @@
     <ol>
       <li>真实 OSS 上传、真实房间广播回执 —— 需要真实账号，请在 <code>app.zerotalk.cn</code> 上实测。</li>
       <li>表情源真实抓取 —— 这里由桩件返回固定的假 HTML；真实抓取已在开发环境实测（斗图啦单页 140 张）。</li>
+      <li><b>官方上传器是桩</b>：这里只观测「change 事件有没有收到文件」，真实的 presign/PUT/bind 由站点自己跑，脚本看不到也无从验证 —— 上了真站要确认图真的出现在聊天里。</li>
     </ol>
   </div>
 </div>
@@ -368,6 +409,31 @@ try {
   window.__ZTM_ROOM_ID__ = 'stubRoom12345678';
   history.replaceState({}, '', '/app/chat/stubRoom12345678?room_id=stubRoom12345678');
 } catch (e) { /* file:// 下无法改 URL，靠 __ZTM_ROOM_ID__ 兜底 */ }
+
+// —— 1.6 站点自己的「发图」上传器（composer 里的 <input type=file>）——
+// 真实站点上这个 input 由 Vue 接管：onImagePicked 会关掉表情面板、重置 input，
+// 然后走官方上传链路。这里只观测「收到文件」这一步并打日志。
+// 日志统一加 [官方上传器] 前缀，这样测试就能把「官方链路」和「用户脚本自己的
+// 直连链路」分得清清楚楚（直连链路的标题是 `POST <base>/api/upload/presign`）。
+// 刻意**不**重置 input.files：测试要在派发 change 之后读到 files 是不是真塞进去了。
+window.__ZX_OFFICIAL__ = { calls: 0, files: [] };
+(function () {
+  var input = document.getElementById('zx-composer-file');
+  if (!input) return;
+  input.addEventListener('change', function () {
+    var list = input.files || [];
+    var brief = [];
+    for (var i = 0; i < list.length; i++) {
+      brief.push({ name: list[i].name, type: list[i].type, size: list[i].size });
+    }
+    window.__ZX_OFFICIAL__.calls++;
+    window.__ZX_OFFICIAL__.files.push(brief);
+    zxLog('[官方上传器] change 事件收到 ' + list.length + ' 个文件',
+      JSON.stringify(brief, null, 2) + '\n（站点自己的上传器接管，用户脚本不参与）');
+    zxLog('[官方上传器] 上传链由站点自己走完',
+      'presign → OSS PUT → bind → WS message(type=image)\n（这几步都在站点代码里，不是用户脚本发的）');
+  });
+})();
 </script>
 
 <!-- 2) 加载被测脚本（未做任何修改） -->

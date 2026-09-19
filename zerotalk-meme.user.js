@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         零语表情包助手 · Zerotalk Meme Helper
 // @namespace    https://app.zerotalk.cn/
-// @version      1.2.2
-// @description  在零语聊天输入区的原生「表情」面板里加一个「梗图」栏，搜索网络梗图并一键以图片消息发送。完整复刻官方上传链路（presign → OSS PUT → bind → WebSocket message），支持手机端 Via 浏览器，支持 GIF 转 WebP。设置面板与站内弹窗同一套视觉。版本号以外的描述同步更新。
+// @version      1.2.4
+// @description  在零语聊天输入区的原生「表情」面板里加一个「梗图」栏，搜索网络梗图并一键以图片消息发送。默认走官方上传通道（把图片交给站点 composer 的上传入口），官方入口不可用时回落到自实现的直连链路（presign → OSS PUT → bind → WebSocket message）。支持手机端 Via 浏览器，支持 GIF 转 WebP。设置面板与站内弹窗同一套视觉。版本号以外的描述同步更新。
 // @author       Neko
 // @match        *://app.zerotalk.cn/*
 // @match        *://*.zerotalk.cn/*
@@ -34,7 +34,7 @@
    * 0. 常量 / 环境
    * =======================================================================*/
 
-  var VERSION = '1.2.2';
+  var VERSION = '1.2.4';
   var PREFIX = 'ztm';
 
   // 从抓包日志还原的服务端常量
@@ -149,7 +149,7 @@
   ];
 
   var SETTINGS_KEY = 'settings';
-  var SETTINGS_VERSION = 2;   // 1 → 2：GIF→WebP 的默认值由「动图」改成「静态」
+  var SETTINGS_VERSION = 3;   // 1→2：GIF→WebP 默认「动图」改「静态」；2→3：缩略图改按「每行张数」
 
   var settings = mergeSettings(store.get(SETTINGS_KEY, {}));
 
@@ -158,7 +158,9 @@
       settingsVersion: SETTINGS_VERSION,
       baseUrl: DEFAULT_BASE,
       tapSend: true,                 // 点一下梗图就直接发送（像原生表情包栏那样）
-      thumbMin: 68,                  // 梗图缩略图最小边(px)，越小一屏看到的越多
+      cols: 6,                       // 每行显示几张（网格列数），决定格子大小
+      sourceId: '',                  // 优先使用的表情源；空 = 自动（按列表顺序尝试）
+      uploadMode: 'auto',            // 上传方式：auto 优先官方通道 · official 只走官方 · manual 只走直连
       autoCompress: true,
       compressOverMB: 4,
       maxDimension: 1600,
@@ -180,7 +182,13 @@
     // 十有八九不是用户特意选的。一次性迁到新默认「静态」，之后用户再改就会被记住。
     var fromV = Number(raw && raw.settingsVersion) || 1;
     if (fromV < 2 && out.gifToWebp === 'anim') out.gifToWebp = 'static';
+    // v3 起网格按「每行张数」排，不再用「缩略图最小边」。老存档里那个 thumbMin
+    // 已经没有任何代码读它了，直接从存储里抹掉，别留个永远不改的僵尸键。
+    if (fromV < 3) delete out.thumbMin;
     out.settingsVersion = SETTINGS_VERSION;
+    // 上传方式是新增键，老存档里没有 → 这个归一化只是防手改存档写进非法值。
+    // 注意：这里不能用文件后面才赋值的 var 常量（本函数在启动时立刻执行，那时它是 undefined）。
+    if (out.uploadMode !== 'official' && out.uploadMode !== 'manual') out.uploadMode = 'auto';
 
     if (!Array.isArray(out.sources) || !out.sources.length) out.sources = clone(DEFAULT_SOURCES);
     return out;
@@ -198,6 +206,31 @@
     var list = settings.sources || [];
     for (var i = 0; i < list.length; i++) { if (list[i].id === id) return list[i]; }
     return list[0] || null;
+  }
+
+  /**
+   * 精确查找一个「可用」的源，找不到就返回 null。
+   * 跟 getSource 的区别：getSource 找不到会回落成第一个（用它做「当前源」是对的），
+   * 但判断「用户选的那个源还在不在」时必须用这个，否则一个被删掉的 id 也会「命中」。
+   */
+  function pickSource(id) {
+    if (!id) return null;
+    var list = settings.sources || [];
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+      if (s && s.id === id && s.enabled !== false && s.url) return s;
+    }
+    return null;
+  }
+
+  /** 本次搜索该优先用哪个源：设置里选的那个，否则第一个可用的 */
+  function firstActiveId() {
+    var list = activeSources();
+    return list[0] ? list[0].id : null;
+  }
+
+  function preferSourceId() {
+    return pickSource(settings.sourceId) ? settings.sourceId : firstActiveId();
   }
 
   /* =========================================================================
@@ -1509,14 +1542,13 @@
     '  font-size:12.5px;font-weight:600;font-family:inherit;cursor:pointer;white-space:nowrap;}',
     '.go:disabled{opacity:.5;cursor:not-allowed;}',
 
-    '.bar2{display:flex;align-items:center;gap:5px;margin-top:5px;flex:0 0 auto;}',
-    '.src{flex:0 1 auto;min-width:0;height:24px;max-width:44%;padding:0 4px;border-radius:6px;',
-    '  border:1px solid var(--line);background:var(--bg2);color:var(--fg);font-size:11px;font-family:inherit;outline:none;}',
-    '.mini{flex:0 0 auto;height:24px;padding:0 7px;border:1px solid var(--line);border-radius:6px;',
-    '  background:var(--bg2);color:var(--fg);font-size:11px;font-family:inherit;cursor:pointer;white-space:nowrap;}',
-    '.mini:active{background:var(--bd);}',
-    '.mini.ic{padding:0;width:24px;font-size:13px;line-height:1;}',
-    '.sp{flex:1 1 auto;min-width:2px;}',
+    /* 设置齿轮：跟搜索框同一行、同高，占 30×30。原来它和源下拉 / 换一批 / 链接 / 本地
+       挤在第二行，那一行有 24px，在只有一百多像素高的面板里太奢侈了 —— 整行撤掉，
+       源切换搬进设置面板，另外三个入口直接去掉。 */
+    '.cfg{flex:0 0 auto;width:30px;height:30px;padding:0;border:1px solid var(--line);border-radius:8px;',
+    '  background:var(--bg2);color:var(--fg2);font-size:14px;line-height:1;font-family:inherit;',
+    '  cursor:pointer;white-space:nowrap;-webkit-tap-highlight-color:transparent;}',
+    '.cfg:active{background:var(--bd);}',
 
     '.st{margin-top:4px;flex:0 0 auto;font-size:10.5px;color:var(--fg2);height:14px;overflow:hidden;',
     '  white-space:nowrap;text-overflow:ellipsis;}',
@@ -1529,13 +1561,15 @@
     '.ft .fi{flex:1 1 auto;min-width:0;font-size:11px;color:var(--fg2);overflow:hidden;',
     '  text-overflow:ellipsis;white-space:nowrap;}',
 
-    /* 缩略图尺寸：梗图栏只有百来像素高，格子一大会连一行半都放不下。
-       用 auto-fill + 下限而不是写死列数 —— 不论面板多宽，格子都稳定落在
-       下限附近（~70px），一屏能看到 2~3 行；面板变宽只会多出列，不会变大。
-       想再大/再小改 --ztm-thumb（设置里有「缩略图最小边」）。 */
+    /* 每行张数：**固定列数**，跟站点自己的两个栏一个路子
+       （.emoji-ui__row 是 repeat(var(--emoji-cols,8),…)、表情包栏是 repeat(4,…)）。
+       之前用 auto-fill + 最小边，而桌面端输入区是 width:100% 撑满的 ——
+       面板一宽列数就自己往上窜（能到 9 列），格子被挤得越来越小。
+       改成固定列数后「每行几张」是确定的，格子尺寸随面板变宽而**变大**。
+       想再大/再小改设置里的「每行显示张数」（--ztm-cols）。 */
     '.grid{flex:1 1 auto;min-height:0;margin-top:5px;overflow-x:hidden;overflow-y:auto;',
     '  overscroll-behavior:contain;-webkit-overflow-scrolling:touch;',
-    '  display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--ztm-thumb,68px),1fr));',
+    '  display:grid;grid-template-columns:repeat(var(--ztm-cols,6),minmax(0,1fr));',
     '  grid-auto-rows:max-content;gap:5px;align-content:start;}',
     '.grid::-webkit-scrollbar{width:0;height:0;}',
     // 那条 1px 描边用 inset box-shadow 画，不用 border：
@@ -1690,10 +1724,10 @@
    */
   function applyPaneVars() {
     if (!ui.pane || !ui.pane.style || typeof ui.pane.style.setProperty !== 'function') return;
-    var n = Number(settings.thumbMin);
-    if (!isFinite(n) || n <= 0) n = 68;
-    n = Math.max(44, Math.min(160, n));
-    ui.pane.style.setProperty('--ztm-thumb', n + 'px');
+    var n = Math.round(Number(settings.cols));
+    if (!isFinite(n) || n <= 0) n = 6;
+    n = Math.max(3, Math.min(12, n));
+    ui.pane.style.setProperty('--ztm-cols', String(n));
   }
 
   /* ---------- 影子根工具 ---------- */
@@ -1728,14 +1762,7 @@
       '  <div class="bar">',
       '    <input class="q" type="search" autocomplete="off" enterkeyhint="search" placeholder="搜索梗图，如：猫 / 无语 / 哈哈">',
       '    <button class="go" data-a="search" type="button">搜索</button>',
-      '  </div>',
-      '  <div class="bar2">',
-      '    <select class="src" data-a="source"></select>',
-      '    <button class="mini" data-a="next" type="button">换一批</button>',
-      '    <button class="mini" data-a="url" type="button">链接</button>',
-      '    <button class="mini" data-a="file" type="button">本地</button>',
-      '    <div class="sp"></div>',
-      '    <button class="mini ic" data-a="cfg" type="button" title="设置" aria-label="设置">⚙</button>',
+      '    <button class="cfg" data-a="cfg" type="button" title="设置" aria-label="设置">⚙</button>',
       '  </div>',
       '  <div class="st"></div>',
       '  <div class="pb off"><i></i></div>',
@@ -1761,7 +1788,6 @@
     ui.els.grid = wrap.querySelector('.grid');
     ui.els.status = wrap.querySelector('.st');
     ui.els.bar = wrap.querySelector('.pb');
-    ui.els.sourceSel = wrap.querySelector('[data-a="source"]');
     ui.els.send = wrap.querySelector('[data-a="send"]');
     ui.els.foot = wrap.querySelector('.ft');
     ui.els.footInfo = wrap.querySelector('.fi');
@@ -1779,9 +1805,6 @@
         var act = el.getAttribute('data-a');
         switch (act) {
           case 'search': doSearch(1); return;
-          case 'next': doSearch((state.page || 1) + 1); return;
-          case 'url': sendFromUrl(); return;
-          case 'file': sendFromFile(); return;
           case 'send': sendSelected(); return;
           case 'cfg': openSettings(); return;
           default: return;
@@ -1796,12 +1819,9 @@
         if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); doSearch(1); }
       });
     }
-    if (ui.els.sourceSel) {
-      ui.els.sourceSel.addEventListener('change', function () { state.sourceId = ui.els.sourceSel.value; });
-    }
 
-    // 下拉里的选项要在建 UI 时就填好。之前只在「保存设置 / 恢复默认」时填，
-    // 结果是刚装好脚本、还没进过设置页的用户，源下拉是个空框。
+    // 这里主要不是为了画下拉（下拉在设置面板里、此刻可能还没建），
+    // 而是为了把「本次优先用哪个源」定下来 —— 搜索要用它。见 renderSources()。
     renderSources();
 
     applyPaneVars();
@@ -1960,10 +1980,23 @@
       '    <div class="sh"><div class="t">梗图助手设置 <span class="ver">v' + VERSION + '</span></div>',
       '      <button class="x" data-a="close-settings" type="button" aria-label="关闭">✕</button></div>',
       '    <div class="sc">',
+      '      <div class="f"><label>表情源</label>',
+      '        <div class="sw"><span class="lbl">搜索时优先使用</span><select data-k="sourceId"></select></div>',
+      '        <div class="hint">选「自动」= 按下面列表的顺序依次尝试，某个源失败就顺延到下一个。要增删或改写源，见下方「编辑表情源列表」。</div>',
+      '      </div>',
       '      <div class="f"><label>服务端地址</label><input type="text" data-k="baseUrl"></div>',
       '      <div class="f"><label>图片代理前缀（无 GM 通道时用于绕过跨域）</label>',
       '        <input type="text" data-k="imageProxy" placeholder="https://wsrv.nl/?url=">',
       '        <div class="hint">留空表示直连。代理会把图片转成可跨域读取的响应。</div></div>',
+      '      <div class="f"><label>上传方式</label>',
+      '        <div class="sw"><span class="lbl">发送时走哪条上传链路</span>',
+      '          <select data-k="uploadMode">',
+      '            <option value="auto">自动（优先官方通道）</option>',
+      '            <option value="official">只用官方通道</option>',
+      '            <option value="manual">只用直连链路</option>',
+      '          </select></div>',
+      '        <div class="hint">「官方通道」= 把图片塞进站点 composer 的图片上传入口，让官方自己走完上传+发送（协议改了也不用我们跟，但只能发 jpeg/png/webp，所以 GIF 会被转成静态图）。「直连链路」= 脚本自己 presign → OSS PUT → bind → 发 WebSocket 帧，能保留动图 WebP、错误提示更细。<b>自动</b>：能找到官方入口就用它，找不到或交接失败自动回落到直连。如果发现图发不出去（或没出现在聊天里），切成「只用直连链路」。</div>',
+      '      </div>',
       '      <div class="f"><label>压缩</label>',
       '        <div class="sw"><span class="lbl">自动压缩超限图片</span>',
       '          <label class="tgl"><input type="checkbox" data-k="autoCompress"><span class="tgl-s"></span></label></div>',
@@ -1982,14 +2015,14 @@
       '        <div class="hint">默认「静态 WebP」：只取首帧，体积最小，而且不依赖内核支持，任何环境都能转。选「动图 WebP」可以保留动画，但它需要内核用 ImageDecoder 逐帧解码再自封装成动图容器（Chrome / 安卓 WebView 94+），内核不支持时会自动降级为静态首帧并明确提示。质量默认 0.70：实测 q=0.9 时产出反而是原 GIF 的 1.5~2 倍（GIF 每帧只存变化区域，WebP 每帧是整幅有损编码），q≈0.7 才稳定压到 0.5~0.85 倍。</div>',
       '      </div>',
       '      <div class="f"><label>显示</label>',
-      '        <div class="sw"><span class="lbl">缩略图最小边(px)</span><input type="number" data-k="thumbMin" min="44" max="120" step="4"></div>',
-      '        <div class="hint">梗图栏只有百来像素高，格子越大一屏能看到的越少。默认 68：每行 4 张、一屏能完整看到 2 行。格子会自动铺满整行，所以实际尺寸会比这个值略大，而且随面板宽度分档（不是精确像素）——按 4px 慢慢调看不出变化，一次跳 10~20 才会换档。</div>',
+      '        <div class="sw"><span class="lbl">每行显示张数</span><input type="number" data-k="cols" min="3" max="12" step="1"></div>',
+      '        <div class="hint">表情栏只有一百多像素高，这个数字直接决定格子大小：默认 6（每行 6 张）。调小（如 4）格子更大、一屏看到的更少；调大（如 8）更密。格子平分面板宽度，所以面板越宽格子越大；反过来手机窄屏上 6 列会偏小，觉得小就调到 4（甚至 3）。</div>',
       '      </div>',
       '      <div class="f"><label>交互</label>',
       '        <div class="sw"><span class="lbl">点击梗图直接发送（关闭后先选中再点「发送」）</span>',
       '          <label class="tgl"><input type="checkbox" data-k="tapSend"><span class="tgl-s"></span></label></div>',
       '      </div>',
-      '      <div class="f"><label>表情源（JSON 数组，可增删）</label>',
+      '      <div class="f"><label>编辑表情源列表（JSON 数组，可增删）</label>',
       '        <textarea data-k="sources"></textarea>',
       '        <div class="hint">html 源：url 支持 {kw} {page}，pattern 为正则字符串，exclude 为可选的排除正则；json 源：额外用 path（如 data.list[].url）取图。</div>',
       '        <div class="btns">',
@@ -2006,7 +2039,7 @@
       '          <button class="b gray" data-a="clear-log" type="button">清空</button>',
       '        </div>',
       '      </div>',
-      '      <div class="hint">上传链路：POST /api/upload/presign → PUT OSS → POST /api/upload/bind → WS message(type=image)，与官方客户端一致。</div>',
+      '      <div class="hint">默认走<b>官方通道</b>：脚本只把图片交给站点自己的上传入口，后面的 presign → PUT OSS → bind → WS message(type=image) 由站点完成。切成「只用直连链路」时，才由脚本自己按同一套协议发。</div>',
       '    </div>',
       '    <div class="sf">',
       '      <button class="b gray" data-a="close-settings" type="button">取消</button>',
@@ -2024,6 +2057,10 @@
     ui.els.sheet = box.querySelector('.mask');
     ui.els.toast = box.querySelector('.toast');
     ui.els.logBox = box.querySelector('.logbox');
+    // 「表情源」下拉现在住在这里（原来在梗图栏的工具行上）。建完就填一次，
+    // 否则用户第一次打开设置会看到一个空下拉。
+    ui.els.sourceSel = box.querySelector('[data-k="sourceId"]');
+    renderSources();
 
     box.addEventListener('click', function (ev) {
       var t = ev.target;
@@ -2117,6 +2154,7 @@
   /* ---------- 设置面板开关 ---------- */
 
   function openSettings() {
+    renderSources();          // 先重建源下拉的选项；它的选中值由下面的 syncSettingsForm 按设置填
     syncSettingsForm();
     if (ui.els.logBox) ui.els.logBox.textContent = logBuf.slice(-80).join('\n');
     if (ui.els.sheet) ui.els.sheet.classList.remove('off');
@@ -2138,21 +2176,35 @@
     grid.appendChild(d);
   }
 
+  /**
+   * 刷新「表情源」下拉（在设置面板里），顺带把本次要用的源定下来。
+   *
+   * 两个职责合在一起是有意的：下拉框挂在设置面板里，而设置面板是懒建的 ——
+   * 梗图栏刚注入时它还不存在。但搜索又必须知道「优先用哪个源」，
+   * 所以状态那一步不能写在 `if (!sel) return` 后面，否则一装好就搜索会用错源。
+   */
   function renderSources() {
+    if (!state.sourceId || !pickSource(state.sourceId)) state.sourceId = preferSourceId();
+
     var sel = ui.els.sourceSel;
     if (!sel) return;
     var list = activeSources();
     sel.innerHTML = '';
+
+    // 「自动」交给 doSearch 的按顺序尝试逻辑（某个源失败就顺延下一个）
+    var auto = document.createElement('option');
+    auto.value = '';
+    auto.textContent = '自动（按顺序尝试）';
+    sel.appendChild(auto);
+
     for (var i = 0; i < list.length; i++) {
       var o = document.createElement('option');
       o.value = list[i].id;
       o.textContent = list[i].name || list[i].id;
       sel.appendChild(o);
     }
-    if (!state.sourceId || !getSource(state.sourceId)) {
-      state.sourceId = list[0] ? list[0].id : null;
-    }
-    if (state.sourceId) sel.value = state.sourceId;
+    // 存的那个源要是已经被删了/禁用了，就显示回「自动」，别留一个不存在的选中项
+    sel.value = pickSource(settings.sourceId) ? settings.sourceId : '';
   }
 
   function renderResults(list) {
@@ -2288,9 +2340,10 @@
     attempt(0).then(function (r) {
       state.results = r.urls;
       if (r.urls.length) {
-        // 记住真正出结果的源，这样「换一批」不用再走一遍失败流程
+        // 记住真正出结果的源，本次会话后面就直接用它。
+        // 注意**不回写设置**：某次失败顺延只是临时的，不该把用户选的源改掉；
+        // 设置面板里那个下拉始终显示用户的偏好。
         state.sourceId = r.src.id;
-        if (ui.els.sourceSel) ui.els.sourceSel.value = r.src.id;
       }
       renderResults(r.urls);
       var name = r.src.name || r.src.id;
@@ -2327,6 +2380,119 @@
     });
   }
 
+  /* =========================================================================
+   * 10.5 正规化上传：把图交给站点自己的图片上传入口
+   *
+   * 我们原先的做法是「照抄协议」——自己 presign → OSS PUT → bind → 发 WS 帧。
+   * 这条路能用（抓包逐字对过），但服务端改协议就得跟着改，而且它绕过了站点
+   * 自己的上传器。更正规的做法是把文件塞进 composer 的 <input type=file>，
+   * 让**官方上传链路**自己去走完那四步：它自己知道收哪些格式、自己做进度与
+   * 失败提示，协议变了也不用我们跟。
+   *
+   * 做法参考站点自己分发的那版脚本（v1.0.2）。注意几条踩过的坑：
+   *   1. 「表情包」栏的上传框（.sticker-ui__file）是收藏表情用的，不是发图，必须跳过；
+   *      表情面板（.composer-emoji-panel）里的输入框同理。
+   *   2. 派发 change **之前不能先把面板关掉**：站点 onImagePicked 会自己关，
+   *      提前关会让 Vue 重建 input，刚塞进去的 files 一起丢掉。
+   *   3. 站点聊天不认 GIF（它自己的 toChatImage 就是把 GIF 转 JPEG），
+   *      所以 GIF 要在交给官方之前先转成静帧。
+   *   4. File / DataTransfer 优先用页面 Realm 的（UNSAFE）：脚本跑在沙箱里，
+   *      用沙箱 Realm 造出来的 FileList 赋给页面元素上的 input.files 不保险。
+   * =======================================================================*/
+
+  /**
+   * 找站点 composer 的「发图」输入框。
+   * 三级优先：composer 行内且收 jpeg > 页面上任意收 jpeg 的 > composer 行内收其他图片的。
+   * 站点自己的发图入口 accept 里一定有 image/jpeg（或 .jpg），所以「收 jpeg」是主判据；
+   * 最后一档兜底**限定在 composer 行内**，免得误抓页面上别的 `input[type=file]`
+   * （换头像、传背景图之类）——参考实现只认 jpeg，我们放宽一档但加了作用域限制。
+   */
+  function findComposerFileInput() {
+    var nodes = document.querySelectorAll('input[type="file"]');
+    var jpg = null;      // 页面上收 jpeg 的（站点发图输入框基本都收 jpeg）
+    var anyImg = null;   // composer 行内任意收图片的，最后兜底
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.disabled) continue;
+      if (el.classList && el.classList.contains('sticker-ui__file')) continue;
+      if (el.closest) {
+        if (el.closest('.composer-emoji-panel')) continue;      // 表情面板里的不是 composer 的
+        if (el.closest('.' + PANE_CLASS)) continue;             // 我们自己的梗图栏
+        if (el.closest('#' + PREFIX + '-host')) continue;       // 我们自己的设置面板
+      }
+      var acc = String(el.getAttribute('accept') || '').toLowerCase();
+      var takesJpg = acc.indexOf('jpeg') >= 0 || acc.indexOf('jpg') >= 0;
+      var takesImg = takesJpg || acc.indexOf('image') >= 0 ||
+        acc.indexOf('png') >= 0 || acc.indexOf('webp') >= 0 || acc.indexOf('gif') >= 0;
+      if (!takesImg) continue;
+      // 写成两次 closest 而不是 '.composer-row,.input-card'：逗号选择器在
+      // 单测桩件的选择器引擎里不支持，拆开既好读也免得桩件给出假结论。
+      var inComposer = el.closest ? (!!el.closest('.composer-row') || !!el.closest('.input-card')) : false;
+      if (takesJpg && inComposer) return el;
+      if (takesJpg && !jpg) jpg = el;
+      if (takesImg && inComposer && !anyImg) anyImg = el;
+    }
+    return jpg || anyImg;
+  }
+
+  function blobToArrayBuffer(blob) {
+    if (blob.arrayBuffer) return blob.arrayBuffer();
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () { resolve(fr.result); };
+      fr.onerror = function () { reject(new Error('读取图片数据失败')); };
+      fr.readAsArrayBuffer(blob);
+    });
+  }
+
+  /**
+   * 把 blob 交给站点的上传入口：造 File → 塞进 input.files → 派发 change。
+   * @returns {Promise<void>} resolve 表示已交接（后续由站点自己上传），reject 表示交接失败
+   */
+  function handoffToComposer(blob) {
+    var input = findComposerFileInput();
+    if (!input) return Promise.reject(new Error('找不到站点的图片上传入口'));
+
+    // 站点聊天不认 GIF；其余非图片类型也一律按 jpeg 交出去（与站点 toChatImage 一致）
+    var mime = String(blob.type || '');
+    if (mime.indexOf('image/') !== 0 || mime === 'image/gif') mime = 'image/jpeg';
+    var name = mime === 'image/png' ? 'meme.png'
+      : mime === WEBP_MIME ? 'meme.webp'
+        : 'meme.jpg';
+
+    return blobToArrayBuffer(blob).then(function (buf) {
+      var FileCtor = UNSAFE.File || File;
+      var DTCtor = UNSAFE.DataTransfer || DataTransfer;
+      var EvCtor = UNSAFE.Event || Event;
+      var file = new FileCtor([buf], name, { type: mime, lastModified: Date.now() });
+      var dt = new DTCtor();
+      dt.items.add(file);
+      input.files = dt.files;
+      if (!input.files || !input.files.length) throw new Error('无法把图片交给官方上传');
+      // 见文件头注释第 2 条：这里绝不能先关面板
+      input.dispatchEvent(new EvCtor('change', { bubbles: true }));
+      log('已交给官方上传通道', name, bytesText(blob.size), mime);
+    });
+  }
+
+  /**
+   * 官方通道只认 jpeg/png/webp。用户把「GIF → WebP」关掉时会走到这里，
+   * 补一次 GIF → 静帧 JPEG，否则官方会拒收（这就是站点自己 toChatImage 干的事）。
+   */
+  function ensureNonGifPayload(got) {
+    if (!isGif(got.blob.type, got.filename)) return Promise.resolve(got);
+    var over = settings.autoCompress ? settings.compressOverMB * 1024 * 1024 : 0;
+    setStatus('GIF 转静态图（官方通道不认 GIF）…');
+    setProgress(0.72);
+    return compressBlob(got.blob, over, settings.maxDimension).then(function (c) {
+      log('官方通道不认 GIF，已转 JPEG：' + bytesText(got.blob.size) + ' → ' + bytesText(c.blob.size));
+      return { blob: c.blob, filename: c.filename };
+    }).catch(function (e) {
+      log('GIF 转静态图失败，仍按原样交给官方：' + e.message);
+      return got;
+    });
+  }
+
   /* ---------- 发送主流程 ---------- */
 
   function sendSelected() {
@@ -2335,34 +2501,80 @@
     sendOne({ type: 'url', url: url });
   }
 
-  function sendFromUrl() {
-    var url = prompt('粘贴图片直链（http/https）', '');
-    if (!url) return;
-    url = String(url).trim();
-    if (!/^https?:\/\//i.test(url)) { toast('请输入以 http(s) 开头的图片链接', 'error'); return; }
-    sendOne({ type: 'url', url: url });
-  }
+  /**
+   * 直连上传（我们自己的链路）：presign → OSS PUT → bind → 发 WS 帧。
+   * 官方通道不可用时用它兜底；也可以用设置强制只走它。
+   * @returns {Promise<{url:string, acked:boolean}>}
+   */
+  function manualUploadAndSend(got, roomId) {
+    function put(blob, filename) {
+      setStatus('上传中（' + bytesText(blob.size) + '）…');
+      setProgress(0.78);
+      return uploadImage(blob, filename, roomId, function (p) {
+        setProgress(0.78 + p * 0.18);
+      });
+    }
 
-  function sendFromFile() {
-    var input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'image/*,.gif';
-    input.style.display = 'none';
-    input.addEventListener('change', function () {
-      var f = input.files && input.files[0];
-      if (!f) { input.remove(); return; }
-      sendOne({ type: 'file', file: f });
-      setTimeout(function () { input.remove(); }, 0);
+    return put(got.blob, got.filename).catch(function (e) {
+      var isWebpFile = (got.blob.type === WEBP_MIME);
+
+      // 服务端不接受 webp（扩展名白名单/iOS 兼容之类）→ 原样回退发原图，别让用户白等
+      if (e.reason === 'unsupported' && got.fallback) {
+        log('服务端不接受 WebP（' + e.message + '），回退发送原图');
+        toast('服务端不支持 WebP，已改发原图', 'warn');
+        setStatus('服务端不支持 WebP，改发原图…');
+        return put(got.fallback.blob, got.fallback.filename);
+      }
+
+      if (e.reason === 'too_large' && settings.autoCompress && !isGif(got.blob.type, got.filename)) {
+        setStatus('服务端提示过大，正在压缩重试…');
+        // WebP 走「降分辨率重转」，别用 JPEG 压，否则动图会变静态
+        var retry = isWebpFile
+          ? convertToWebpFitted(got.blob, settings.gifToWebp, Math.max(160, Math.round(settings.webpMaxDim * 0.6)),
+            Math.max(0.5, settings.webpQuality - 0.15), 1024 * 1024)
+          : compressBlob(got.blob, 1024 * 1024, settings.maxDimension).then(function (c) {
+            c.filename = ensureExt('meme.jpg', c.blob.type);
+            return c;
+          });
+        return retry.then(function (c) {
+          if (c.blob && c.blob.type === WEBP_MIME) c.filename = 'meme.webp';
+          return put(c.blob, c.filename);
+        });
+      }
+      throw e;
+    }).then(function (bound) {
+      setProgress(0.97);
+      setStatus('发送中…');
+      return sendImageFrame(bound.url).then(function (res) {
+        return { url: bound.url, acked: !!(res && res.acked) };
+      });
     });
-    ui.shadow.appendChild(input);
-    input.click();
   }
 
+  // v1.2.3 起面板上不再有「链接」「本地」两个入口（面板只有一百多像素高，
+  // 这一行按钮太占地方）。sendOne 仍然支持 { type:'url' } / { type:'file' }，
+  // 想恢复的话只要把按钮加回 paneHtml 的 .bar 并接上对应分支即可。
   function sendOne(src) {
-    var roomId = getRoomId();
-    if (!roomId) { toast('请先进入一个聊天房间', 'error'); return; }
-    if (!liveSocket()) { toast('聊天连接未就绪，请刷新页面', 'error'); return; }
     if (state.busy) { toast('正在处理上一张，请稍候'); return; }
+
+    // 上传方式（v1.2.4）：auto = 能找到站点的图片上传入口就交给官方，
+    // 找不到/交接失败再回落到我们自己的直连链路；official / manual 则强制只走一条。
+    var mode = (settings.uploadMode === 'official' || settings.uploadMode === 'manual')
+      ? settings.uploadMode : 'auto';
+    var useOfficial = mode !== 'manual' && !!findComposerFileInput();
+    if (mode === 'official' && !useOfficial) {
+      toast('找不到站点的图片上传入口，请先打开表情面板再发', 'error');
+      return;
+    }
+
+    // 官方通道是站点自己在传，不需要我们 hook 到 WS、也不需要房间 id；
+    // 只有走直连链路时才校验这两样。
+    var roomId = null;
+    if (!useOfficial) {
+      roomId = getRoomId();
+      if (!roomId) { toast('请先进入一个聊天房间', 'error'); return; }
+      if (!liveSocket()) { toast('聊天连接未就绪，请刷新页面', 'error'); return; }
+    }
 
     state.busy = true;
     setSendEnabled(false);
@@ -2449,59 +2661,43 @@
         return got;
       })
       .then(function (got) {
-        setStatus('上传中（' + bytesText(got.blob.size) + '）…');
-        setProgress(0.78);
-        return uploadImage(got.blob, got.filename, roomId, function (p) {
-          setProgress(0.78 + p * 0.18);
-        }).catch(function (e) {
-          var isWebpFile = (got.blob.type === WEBP_MIME);
-
-          // 服务端不接受 webp（扩展名白名单/iOS 兼容之类）→ 原样回退发原图，别让用户白等
-          if (e.reason === 'unsupported' && got.fallback) {
-            log('服务端不接受 WebP（' + e.message + '），回退发送原图');
-            toast('服务端不支持 WebP，已改发原图', 'warn');
-            setStatus('服务端不支持 WebP，改发原图…');
-            var fb = got.fallback;
-            return uploadImage(fb.blob, fb.filename, roomId, function (p) {
-              setProgress(0.78 + p * 0.18);
+        if (!useOfficial) {
+          return manualUploadAndSend(got, roomId).then(function (res) {
+            return { via: 'manual', res: res };
+          });
+        }
+        // —— 官方通道：只负责把图交接过去，上传/发送由站点自己做 ——
+        return ensureNonGifPayload(got).then(function (g2) {
+          setStatus('交给官方上传（' + bytesText(g2.blob.size) + '）…');
+          setProgress(0.86);
+          return handoffToComposer(g2.blob).then(function () {
+            return { via: 'official' };
+          }, function (e) {
+            log('官方上传入口交接失败：' + e.message);
+            if (mode === 'official') throw e;
+            // auto：安静回落到自己的直连链路，别让用户白等
+            toast('官方通道不可用，改用直连上传', 'warn');
+            var rid = getRoomId();
+            if (!rid || !liveSocket()) {
+              throw new Error('官方通道不可用，且聊天连接未就绪');
+            }
+            return manualUploadAndSend(g2, rid).then(function (res) {
+              return { via: 'manual', res: res };
             });
-          }
-
-          if (e.reason === 'too_large' && settings.autoCompress && !isGif(got.blob.type, got.filename)) {
-            setStatus('服务端提示过大，正在压缩重试…');
-            // WebP 走「降分辨率重转」，别用 JPEG 压，否则动图会变静态
-            var retry = isWebpFile
-              ? convertToWebpFitted(got.blob, settings.gifToWebp, Math.max(160, Math.round(settings.webpMaxDim * 0.6)),
-                Math.max(0.5, settings.webpQuality - 0.15), 1024 * 1024)
-              : compressBlob(got.blob, 1024 * 1024, settings.maxDimension).then(function (c) {
-                c.filename = ensureExt('meme.jpg', c.blob.type);
-                return c;
-              });
-            return retry.then(function (c) {
-              if (c.blob && c.blob.type === WEBP_MIME) c.filename = 'meme.webp';
-              return uploadImage(c.blob, c.filename, roomId, function (p) {
-                setProgress(0.78 + p * 0.18);
-              });
-            });
-          }
-          throw e;
-        });
-      })
-      .then(function (bound) {
-        setProgress(0.97);
-        setStatus('发送中…');
-        return sendImageFrame(bound.url).then(function (res) {
-          return { bound: bound, acked: !!(res && res.acked) };
+          });
         });
       })
       .then(function (r) {
         setProgress(1);
-        if (r.acked) {
+        if (r.via === 'official') {
+          toast('已交给官方上传 ✓', 'ok');
+          setStatus('已交给官方上传，稍候图片出现即可');
+        } else if (r.res.acked) {
           toast('已发送 ✓', 'ok');
-          setStatus('已发送：' + shortUrl(r.bound.url));
+          setStatus('已发送：' + shortUrl(r.res.url));
         } else {
           toast('已提交，但未收到回执，请确认是否送达', 'warn');
-          setStatus('已提交（未收到回执）：' + shortUrl(r.bound.url));
+          setStatus('已提交（未收到回执）：' + shortUrl(r.res.url));
         }
         clearCell('');
         setTimeout(function () { setProgress(null); }, 700);
@@ -2566,8 +2762,11 @@
     }
     settings = mergeSettings(next);
     saveSettings();
+    // 优先源以设置为准（选「自动」就回到列表第一个）。必须写在 renderSources 之前：
+    // renderSources 只会在「当前源已失效」时才重新挑，从 A 改成 B 是不管的。
+    state.sourceId = preferSourceId();
     renderSources();
-    applyPaneVars();                       // 缩略图尺寸可能被改了，立刻生效
+    applyPaneVars();                       // 每行张数可能被改了，立刻生效
     setFootVisible(!settings.tapSend);
     if (!settings.tapSend) setSendEnabled(false);
     closeSettings();
