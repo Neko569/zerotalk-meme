@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>零语表情包助手 · 离线联调预览</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #eef0f4; color: #1c1d21;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #14151a; color: #e9eaee; } }
+  .page { max-width: 900px; margin: 0 auto; padding: 22px 18px 140px; }
+  h1 { font-size: 19px; margin: 0 0 4px; }
+  .sub { color: #6b7280; font-size: 12.5px; margin-bottom: 18px; }
+  @media (prefers-color-scheme: dark) { .sub { color: #9aa0a6; } }
+  .card {
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 12px;
+    padding: 14px 16px; margin-bottom: 14px;
+  }
+  @media (prefers-color-scheme: dark) { .card { background: #1c1d21; border-color: #33363d; } }
+  .card h2 { font-size: 13.5px; margin: 0 0 8px; display: flex; align-items: center; gap: 8px; }
+  .pill { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 10px; background: #e8734a; color: #fff; }
+  ol { margin: 0; padding-left: 20px; font-size: 13px; }
+  ol li { margin-bottom: 3px; }
+  pre {
+    margin: 8px 0 0; padding: 10px 12px; border-radius: 8px; background: #f6f7f9;
+    border: 1px solid #e5e7eb; font-size: 11.5px; line-height: 1.55;
+    white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow: auto;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { pre { background: #202227; border-color: #33363d; } }
+  .warn { background: #fff7e6; border-color: #ffd591; color: #874d00; }
+  @media (prefers-color-scheme: dark) { .warn { background: #3a2e17; border-color: #6b5220; color: #ffd591; } }
+  button {
+    height: 30px; padding: 0 12px; border-radius: 8px; border: 1px solid #d9dce1;
+    background: #fff; cursor: pointer; font-size: 12.5px;
+  }
+  @media (prefers-color-scheme: dark) { button { background: #26282d; border-color: #3a3d44; color: #e9eaee; } }
+  .chatmock {
+    border: 1px dashed #c9ced6; border-radius: 12px; height: 260px; position: relative;
+    background: repeating-linear-gradient(45deg, #fafbfc, #fafbfc 10px, #f3f5f8 10px, #f3f5f8 20px);
+    overflow: hidden;
+  }
+  @media (prefers-color-scheme: dark) {
+    .chatmock { border-color: #3a3d44; background: repeating-linear-gradient(45deg, #1a1b20, #1a1b20 10px, #202227 10px, #202227 20px); }
+  }
+  .chatmock .hintbox { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #9aa0a6; font-size: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  #zx-log { max-height: 340px; }
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>零语表情包助手 · 离线联调预览</h1>
+  <div class="sub">不连真实站点，用桩件（stub）跑通「搜索 → 下载 → presign → PUT → bind → WebSocket」全链路，用来核对请求是否与抓包一致。</div>
+
+  <div class="card">
+    <h2>怎么用 <span class="pill">3 步</span></h2>
+    <ol>
+      <li>点右下角 😊 悬浮球打开面板。</li>
+      <li>输入任意关键词（如 <b>哈哈</b>）→ 搜索 → 点一张图选中 → 发送。</li>
+      <li>滚到本页下方看 <b>请求日志</b>，逐条对照 <code>PROTOCOL.md</code> 里的抓包格式。</li>
+    </ol>
+    <div class="row">
+      <button id="btn-copy">复制请求日志</button>
+      <button id="btn-clear">清空日志</button>
+      <button id="btn-open">打开面板</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>模拟聊天页</h2>
+    <div class="chatmock"><div class="hintbox">（这里在真实站点上是聊天界面，本页只放一个占位）</div></div>
+  </div>
+
+  <div class="card">
+    <h2>请求日志 <span class="pill" id="req-count">0</span></h2>
+    <pre id="zx-log">等待操作…</pre>
+  </div>
+
+  <div class="card warn">
+    <h2>本地预览无法验证的部分</h2>
+    <ol>
+      <li>真实 OSS 上传、真实房间广播回执 —— 需要真实账号，请在 <code>app.zerotalk.cn</code> 上实测。</li>
+      <li>表情源真实抓取 —— 这里由桩件返回固定的假 HTML；真实抓取已在开发环境实测（斗图啦单页 140 张）。</li>
+    </ol>
+  </div>
+</div>
+
+<script>
+/* ===========================================================================
+ * 1) 桩件：模拟用户脚本管理器提供的 API + 页面 XHR / WebSocket
+ * ========================================================================*/
+
+var ZXLOG = [];
+var zxLogEl = document.getElementById('zx-log');
+var zxCountEl = document.getElementById('req-count');
+
+function zxLog(title, detail) {
+  ZXLOG.push('### ' + title + (detail ? '\n' + detail : ''));
+  zxLogEl.textContent = ZXLOG.join('\n\n');
+  zxCountEl.textContent = ZXLOG.length;
+}
+
+// —— 1.1 假的图片字节（1x1 透明 PNG）——
+var PNG_BYTES;
+(function () {
+  var b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+  var bin = atob(b64);
+  var u8 = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  PNG_BYTES = u8.buffer;
+})();
+
+// —— 1.2 假的表情源 HTML（结构与真实站点一致）——
+var FAKE_IDS = ['a1b2c3d4', 'e5f6a7b8', 'c9d0e1f2', 'a3b4c5d6', 'e7f8a9b0', 'c1d2e3f4',
+  'a5b6c7d8', 'e9f0a1b2', 'c3d4e5f6', 'a7b8c9d0', 'e1f2a3b4', 'c5d6e7f8'];
+function fakeSearchHtml(kw) {
+  return '<html><body>关键词 ' + kw +
+    FAKE_IDS.map(function (id, i) {
+      return '<a href="/photo/' + i + '"><img src="https://img.doutupk.com/production/uploads/image/2024/01/0' +
+        (i % 9 + 1) + '/2024010' + (i % 9 + 1) + '123456_' + id + '.jpg"/></a>';
+    }).join('') +
+    '<img src="//static.doutupk.com/css/img/logo.png"/>' +
+    '<img src="http://img.doutupk.com/production/uploads/image/2024/02/02/2024020212345678_zz99yy.gif"/>' +
+    '</body></html>';
+}
+
+// —— 1.3 GM_* 桩件 ——
+window.GM_getValue = function (k, d) {
+  try { var v = localStorage.getItem('zx:' + k); return v === null ? d : JSON.parse(v); }
+  catch (e) { return d; }
+};
+window.GM_setValue = function (k, v) { try { localStorage.setItem('zx:' + k, JSON.stringify(v)); } catch (e) {} };
+window.GM_addStyle = function (css) { var s = document.createElement('style'); s.textContent = css; document.head.appendChild(s); };
+window.GM_registerMenuCommand = function () {};
+
+window.GM_xmlhttpRequest = function (o) {
+  var url = o.url;
+  setTimeout(function () {
+    if (/doutupk\.com\/search/.test(url)) {
+      var body = fakeSearchHtml(decodeURIComponent((url.match(/keyword=([^&]*)/) || [, ''])[1] || ''));
+      zxLog('GM_xmlhttpRequest  GET ' + url, '→ 200  text/html  ' + body.length + ' bytes（桩：假的斗图啦搜索页）');
+      o.onload && o.onload({ status: 200, responseHeaders: 'content-type: text/html', response: body });
+      return;
+    }
+    if (/\.(jpg|jpeg|png|gif|webp)/i.test(url)) {
+      zxLog('GM_xmlhttpRequest  GET ' + url, '→ 200  image/png  ' + PNG_BYTES.byteLength + ' bytes（桩：假图片字节）');
+      o.onload && o.onload({ status: 200, responseHeaders: 'content-type: image/png', response: PNG_BYTES });
+      return;
+    }
+    if (/wsrv\.nl/.test(url)) {
+      zxLog('GM_xmlhttpRequest  GET ' + url, '→ 200  image/png（桩：图片代理）');
+      o.onload && o.onload({ status: 200, responseHeaders: 'content-type: image/png', response: PNG_BYTES });
+      return;
+    }
+    zxLog('GM_xmlhttpRequest  GET ' + url, '→ 404（桩未覆盖）');
+    o.onerror && o.onerror(new Error('404'));
+  }, 180);
+};
+
+// —— 1.4 假的站点 API（对照 PROTOCOL.md）——
+var BOUND_STORE = {};
+var RealXHR = window.XMLHttpRequest;
+
+function FakeXHR() {
+  this.readyState = 0; this.status = 0; this.responseText = ''; this.response = '';
+  this.responseType = ''; this.timeout = 0; this.withCredentials = false;
+  this.upload = {};
+  this._h = {};
+}
+FakeXHR.prototype.open = function (m, u) { this._m = m; this._u = u; this.readyState = 1; };
+FakeXHR.prototype.setRequestHeader = function (k, v) { this._h[k.toLowerCase()] = v; };
+FakeXHR.prototype.abort = function () {};
+FakeXHR.prototype.getAllResponseHeaders = function () { return ''; };
+FakeXHR.prototype.send = function (body) {
+  var self = this;
+  var url = this._u;
+  var headerText = Object.keys(this._h).map(function (k) { return '    ' + k + ': ' + self._h[k]; }).join('\n');
+
+  setTimeout(function () {
+    // A) presign
+    if (/\/api\/upload\/presign$/.test(url)) {
+      var form = new URLSearchParams(String(body || ''));
+      var p = {};
+      form.forEach(function (v, k) { p[k] = v; });
+      zxLog('POST ' + url + '\n' + headerText + '\n  body: ' + String(body),
+        '→ code=1\n  ' + JSON.stringify({
+          ticket_id: 'stub-' + Math.random().toString(16).slice(2, 10),
+          upload_url: 'https://zerotalk.oss-cn-beijing.aliyuncs.com/zt_assets/chat/img/stub.png?x-oss-expires=600',
+          headers: { 'Content-Type': p.content_type },
+          content_length: Number(p.bytes)
+        }, null, 2));
+      var ticket = 'stub-ticket-' + Math.random().toString(16).slice(2, 10);
+      BOUND_STORE.pending = { ticket: ticket, bytes: p.bytes, type: p.content_type };
+      self.status = 200; self.responseText = JSON.stringify({
+        code: 1,
+        data: {
+          ticket_id: ticket,
+          upload_url: 'https://zerotalk.oss-cn-beijing.aliyuncs.com/zt_assets/chat/img/stub/' +
+            Date.now() + '.png?x-oss-expires=600',
+          headers: { 'Content-Type': p.content_type },
+          content_length: Number(p.bytes)
+        }
+      });
+      self._done();
+      return;
+    }
+    // B) bind
+    if (/\/api\/upload\/bind$/.test(url)) {
+      var bf = new URLSearchParams(String(body || ''));
+      var tk = bf.get('ticket_id');
+      var rec = BOUND_STORE.pending || {};
+      var finalUrl = 'https://zerotalk.oss-cn-beijing.aliyuncs.com/zt_assets/chat/img/stub/final-' + Date.now() + '.png';
+      zxLog('POST ' + url + '\n' + headerText + '\n  body: ' + String(body),
+        '→ code=1\n  ' + JSON.stringify({
+          url: finalUrl, upload_file_id: 998877, ticket_id: tk,
+          file_size: Number(rec.bytes || 0), mime_type: rec.type || 'image/png'
+        }, null, 2));
+      self.status = 200; self.responseText = JSON.stringify({
+        code: 1,
+        data: {
+          url: finalUrl, upload_file_id: 998877, ticket_id: tk,
+          file_size: Number(rec.bytes || 0), mime_type: rec.type || 'image/png',
+          upload_source: 'chat_image'
+        }
+      });
+      self._done();
+      return;
+    }
+    // C) OSS PUT
+    if (/aliyuncs\.com/.test(url)) {
+      zxLog('PUT ' + url.split('?')[0] + '\n' + headerText + '\n  body: <Blob ' + (body && body.size) + ' bytes>',
+        '→ 200 OK（桩：假 OSS）');
+      self.status = 200; self.responseText = '';
+      self._done();
+      return;
+    }
+    zxLog(self._m + ' ' + url, '→ 404（桩未覆盖）');
+    self.status = 404; self.responseText = '';
+    self._done();
+  }, 260);
+};
+FakeXHR.prototype._done = function () {
+  this.readyState = 4;
+  if (this.onreadystatechange) this.onreadystatechange();
+  if (this.onload) this.onload();
+};
+window.XMLHttpRequest = FakeXHR;
+
+// —— 1.5 假的 WebSocket（会被用户脚本 hook 包装）——
+var LAST_FRAME = null;
+var RealWS = window.WebSocket;
+function FakeWS(url) {
+  var self = this;
+  this.url = url; this.readyState = 1; this.binaryType = 'blob';
+  this._listeners = {};
+  zxLog('new WebSocket(' + url + ')', '→ 桩：OPEN（用户脚本应捕获到它）');
+  setTimeout(function () {
+    self._emit('message', { data: JSON.stringify({ event: 'auth_success' }) });
+  }, 120);
+  return this;
+}
+FakeWS.prototype.addEventListener = function (t, fn) {
+  (this._listeners[t] = this._listeners[t] || []).push(fn);
+};
+FakeWS.prototype.removeEventListener = function () {};
+FakeWS.prototype._emit = function (t, ev) {
+  (this._listeners[t] || []).forEach(function (f) { f(ev); });
+};
+FakeWS.prototype.send = function (data) {
+  var frame = JSON.parse(data);
+  LAST_FRAME = frame;
+  var detail = '→ 帧内容：\n' + JSON.stringify(frame, null, 2);
+  var expect = { event: 'message', content: '<图片URL>', type: 'image', image_url: '<图片URL>' };
+  detail += '\n\n  与官方 sendImageMessage 的期望帧对比：\n  ' + JSON.stringify(expect, null, 2).replace(/\n/g, '\n  ');
+  var keys = Object.keys(frame).sort().join(',');
+  var ok = keys === 'content,event,image_url,type';
+  zxLog('WS → ' + data, detail + '\n\n  ' + (ok ? '✅ 字段集合一致（无多余字段）' : '⚠️ 字段集合不同，请核对'));
+
+  // 模拟服务端把消息广播回来，作为「发送成功」回执
+  var self = this;
+  setTimeout(function () {
+    self._emit('message', { data: JSON.stringify({ event: 'message', message_id: Date.now(), type: 'image', content: frame.content, image_url: frame.image_url }) });
+  }, 200);
+};
+FakeWS.prototype.close = function () { this.readyState = 3; };
+FakeWS.CONNECTING = 0; FakeWS.OPEN = 1; FakeWS.CLOSING = 2; FakeWS.CLOSED = 3;
+window.WebSocket = FakeWS;
+
+// 让脚本能定位到「房间」
+try {
+  window.__ZTM_ROOM_ID__ = 'stubRoom12345678';
+  history.replaceState({}, '', '/app/chat/stubRoom12345678?room_id=stubRoom12345678');
+} catch (e) { /* file:// 下无法改 URL，靠 __ZTM_ROOM_ID__ 兜底 */ }
+</script>
+
+<!-- 2) 加载被测脚本（未做任何修改） -->
+<script src="zerotalk-meme.user.js"></script>
+
+<script>
+/* 3) 模拟「App 在页面加载时建立了聊天长连接」 */
+setTimeout(function () {
+  try { window.__ztmAppSocket = new window.WebSocket('wss://app.zerotalk.cn/ws'); }
+  catch (e) { zxLog('创建模拟 App 连接失败', String(e)); }
+}, 60);
+
+/* 4) 页面按钮 */
+document.getElementById('btn-clear').onclick = function () { ZXLOG.length = 0; zxLogEl.textContent = '已清空'; zxCountEl.textContent = '0'; };
+document.getElementById('btn-copy').onclick = function () {
+  var t = ZXLOG.join('\n\n');
+  if (navigator.clipboard) navigator.clipboard.writeText(t).then(function () { alert('已复制 ' + ZXLOG.length + ' 条'); });
+  else alert('当前环境不支持剪贴板，请手动选中复制');
+};
+document.getElementById('btn-open').onclick = function () {
+  var host = document.getElementById('ztm-host');
+  if (!host || !host.shadowRoot) { alert('脚本还没加载完成，稍等一下或刷新页面'); return; }
+  var fab = host.shadowRoot.querySelector('.fab');
+  if (fab) fab.click();
+};
+
+/* 5) 缩略图：真实的 mock.meme 域名不存在，这里替换成可显示的占位图，便于看 UI */
+(function () {
+  var SVGS = [
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="160" height="160" fill="#ffd9c9"/><text x="80" y="92" font-size="56" text-anchor="middle">😂</text></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="160" height="160" fill="#cfe8ff"/><text x="80" y="92" font-size="56" text-anchor="middle">🐱</text></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="160" height="160" fill="#d8f5dd"/><text x="80" y="92" font-size="56" text-anchor="middle">🤔</text></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="160" height="160" fill="#ffeab8"/><text x="80" y="92" font-size="56" text-anchor="middle">😭</text></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="160" height="160" fill="#e6ddff"/><text x="80" y="92" font-size="56" text-anchor="middle">🐶</text></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="160" height="160" fill="#ffd9e6"/><text x="80" y="92" font-size="56" text-anchor="middle">🙈</text></svg>'
+  ];
+  var i = 0;
+  var obs = new MutationObserver(function () {
+    var host = document.getElementById('ztm-host');
+    if (!host || !host.shadowRoot) return;
+    host.shadowRoot.querySelectorAll('.grid img').forEach(function (img) {
+      if (img.src.indexOf('img.doutupk.com') === -1) return;
+      if (img.getAttribute('data-zx')) return;
+      img.setAttribute('data-zx', '1');
+      img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(SVGS[(i++) % SVGS.length]);
+    });
+  });
+  obs.observe(document.documentElement, { childList: true, subtree: true });
+})();
+</script>
+</body>
+</html>
