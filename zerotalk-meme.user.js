@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         零语表情包助手 · Zerotalk Meme Helper
 // @namespace    https://app.zerotalk.cn/
-// @version      1.1.1
-// @description  悬浮窗搜索网络表情包，一键以图片消息发送到零语聊天房间。完整复刻官方上传链路（presign → OSS PUT → bind → WebSocket message），支持手机端 Via 浏览器，支持 GIF 转 WebP。
+// @version      1.2.2
+// @description  在零语聊天输入区的原生「表情」面板里加一个「梗图」栏，搜索网络梗图并一键以图片消息发送。完整复刻官方上传链路（presign → OSS PUT → bind → WebSocket message），支持手机端 Via 浏览器，支持 GIF 转 WebP。设置面板与站内弹窗同一套视觉。版本号以外的描述同步更新。
 // @author       Neko
 // @match        *://app.zerotalk.cn/*
 // @match        *://*.zerotalk.cn/*
@@ -34,7 +34,7 @@
    * 0. 常量 / 环境
    * =======================================================================*/
 
-  var VERSION = '1.1.1';
+  var VERSION = '1.2.2';
   var PREFIX = 'ztm';
 
   // 从抓包日志还原的服务端常量
@@ -149,24 +149,26 @@
   ];
 
   var SETTINGS_KEY = 'settings';
+  var SETTINGS_VERSION = 2;   // 1 → 2：GIF→WebP 的默认值由「动图」改成「静态」
 
   var settings = mergeSettings(store.get(SETTINGS_KEY, {}));
 
   function mergeSettings(raw) {
     var base = {
+      settingsVersion: SETTINGS_VERSION,
       baseUrl: DEFAULT_BASE,
-      skipConfirm: false,
+      tapSend: true,                 // 点一下梗图就直接发送（像原生表情包栏那样）
+      thumbMin: 68,                  // 梗图缩略图最小边(px)，越小一屏看到的越多
       autoCompress: true,
       compressOverMB: 4,
       maxDimension: 1600,
-      gifToWebp: 'anim',
+      gifToWebp: 'static',           // 静态首帧：体积小、且不依赖 ImageDecoder
       webpMaxDim: 480,
       webpQuality: 0.7,
       imageProxy: 'https://wsrv.nl/?url=',
       preferHookSocket: true,
       allowStandaloneSocket: false,
       showLog: false,
-      theme: 'auto',
       sources: null
     };
     var out = {};
@@ -174,6 +176,12 @@
     if (raw && typeof raw === 'object') {
       for (var k2 in raw) { if (Object.prototype.hasOwnProperty.call(raw, k2)) out[k2] = raw[k2]; }
     }
+    // 老版本没写过 settingsVersion，它存下来的 gifToWebp:'anim' 只是「当时的默认值」，
+    // 十有八九不是用户特意选的。一次性迁到新默认「静态」，之后用户再改就会被记住。
+    var fromV = Number(raw && raw.settingsVersion) || 1;
+    if (fromV < 2 && out.gifToWebp === 'anim') out.gifToWebp = 'static';
+    out.settingsVersion = SETTINGS_VERSION;
+
     if (!Array.isArray(out.sources) || !out.sources.length) out.sources = clone(DEFAULT_SOURCES);
     return out;
   }
@@ -210,9 +218,10 @@
     if (settings.showLog) {
       try { console.log('%c[表情包]', 'color:#e8734a;font-weight:bold', line); } catch (e) { /* ignore */ }
     }
-    if (ui && ui.isOpen && ui.logBox && ui.logBox.parentNode) {
-      ui.logBox.textContent = logBuf.slice(-80).join('\n');
-      ui.logBox.scrollTop = ui.logBox.scrollHeight;
+    if (ui && ui.els && ui.els.sheet && ui.els.logBox && ui.els.logBox.parentNode &&
+      !ui.els.sheet.classList.contains('off')) {
+      ui.els.logBox.textContent = logBuf.slice(-80).join('\n');
+      ui.els.logBox.scrollTop = ui.els.logBox.scrollHeight;
     }
   }
 
@@ -1361,138 +1370,724 @@
    * 11. UI
    * =======================================================================*/
 
+  /* =========================================================================
+   * 11. UI：把「梗图搜索」整合进站点原生表情面板
+   *
+   * 不再有独立悬浮窗。做法是往站点自带的「表情」面板里再插一个 Tab：
+   *
+   *   div.composer-emoji-panel                      ← 站点原生，常驻 DOM，
+   *     div.composer-emoji-panel__slide               仅靠 inert / --open 开关
+   *       div.composer-emoji-panel__body
+   *         div.emoji-mode-tabs                     ← 原生只有 Emoji / 表情包 两个 Tab
+   *         div.emoji-swap[data-mode]
+   *           div.emoji-swap__track                 ← 横向 200% 轨道，靠 data-mode 平移
+   *             div.emoji-swap__pane (emoji)
+   *             div.emoji-swap__pane (表情包)
+   *
+   * 我们追加第 3 个 Tab + 第 3 个 pane，并且**用属性而不是 class** 标记当前模式：
+   * Vue 每次重渲染都会覆盖 class（patchClass 直接给 className 赋值），
+   * 但它不会碰自己 vnode 里没声明过的属性，所以 data-ztm-meme 能稳定存活。
+   *
+   * 面板本身是 20rem 定高、`.emoji-swap` overflow:hidden，所以只要把轨道加宽到
+   * 300%、每栏 1/3、整体再平移两屏，就能得到与原生完全一致的滑动切换手感。
+   * =======================================================================*/
+
   var ui = {
-    host: null, root: null, shadow: null, isOpen: false,
-    logBox: null, els: {}
+    // 覆盖层（toast / 设置面板）—— 自带 shadow root，和站点样式互不污染
+    host: null, shadow: null, ovRoot: null,
+    // 站点原生表情面板里的注入点
+    panel: null, tabs: null, swap: null, track: null, tab: null, pane: null, active: false,
+    // 站内影子根里的控件
+    els: {}, logBox: null
   };
 
-  var CSS = [
-    ':host{all:initial;}',
-    '*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}',
-    /* 交互层显式声明可点，不依赖继承（宿主/包裹层可能被置为 pointer-events:none） */
-    '.fab,.panel{pointer-events:auto;}',
-    /* 移动端：去掉 300ms 点击延迟，控件内的手势交给浏览器原生处理 */
-    '.ib,.btn,.cell,.sw input,.srch input,.row select{touch-action:manipulation;}',
-    '.hd,.fab{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}',
-    '.wrap{',
-    '  --bg:#ffffff; --bg2:#f6f7f9; --fg:#1c1d21; --fg2:#6b7280; --line:#e5e7eb;',
-    '  --brand:#e8734a; --brand2:#ff9a6b; --ok:#16a34a; --err:#dc2626;',
-    '  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;',
-    '  font-size:14px; line-height:1.5; color:var(--fg);',
-    '}',
-    '.wrap.dark{--bg:#1c1d21; --bg2:#26282d; --fg:#f2f3f5; --fg2:#9aa0a6; --line:#3a3d44;}',
+  var state = {
+    query: '', page: 1, results: [], selected: null, busy: false, sourceId: null
+  };
 
-    /* FAB */
-    '.fab{position:fixed;z-index:2147483000;width:46px;height:46px;border-radius:23px;',
-    '  background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border:0;',
-    '  box-shadow:0 6px 18px rgba(232,115,74,.42);display:flex;align-items:center;justify-content:center;',
-    '  font-size:20px;cursor:pointer;touch-action:none;user-select:none;transition:transform .15s;}',
-    '.fab:active{transform:scale(.92);}',
-    '.fab.hidden{display:none;}',
+  var SITE_READY = 'data-ztm-ready';     // 挂在 .composer-emoji-panel，表示注入成功
+  var SITE_MODE = 'data-ztm-meme';       // 挂在 .emoji-mode-tabs / .emoji-swap，表示当前是梗图栏
+  var TAB_CLASS = 'ztm-tab';
+  var PANE_CLASS = 'ztm-pane';
+  var SCOPE_RE = /^data-v-[0-9a-f]+$/i;  // Vue SFC 作用域属性，形如 data-v-db343221
 
-    /* Panel */
-    '.panel{position:fixed;z-index:2147483001;display:flex;flex-direction:column;',
-    '  background:var(--bg);border:1px solid var(--line);border-radius:14px;overflow:hidden;',
-    '  box-shadow:0 18px 48px rgba(0,0,0,.22);}',
-    '.panel.hidden{display:none;}',
-    '.panel.full{left:0!important;right:0!important;top:auto!important;bottom:0!important;width:auto!important;height:72vh!important;border-radius:14px 14px 0 0;}',
-    /* 底部大面板时宽高由 !important 锁死，缩放手柄无意义且会挡住内容 */
-    '.panel.full .rz{display:none;}',
-    '.panel.full .hd{cursor:default;}',
+  /* 宿主页面覆盖样式：必须放在文档里（要能命中站点的元素） */
+  var SITE_CSS = [
+    /* —— 一律以 [data-ztm-ready] 为前提，注入失败时原生两栏布局不受影响 —— */
+    '.composer-emoji-panel[' + SITE_READY + '] .emoji-swap__track{width:300%!important;}',
+    '.composer-emoji-panel[' + SITE_READY + '] .emoji-swap__pane{width:33.333333%!important;flex:0 0 33.333333%!important;}',
+    /* 真三等分。flex-basis 是 0，所以外宽完全由 padding+border 决定：
+       原生 <button> 带浏览器默认的 1px 6px 内边距（左右共 12px），如果只让我的
+       Tab 用 padding:0，它就会比另外两个窄 12px。三个统一成同一个值即可。
+       按钮文字本来就是居中的，所以对原生外观没有可见改变。 */
+    '.composer-emoji-panel[' + SITE_READY + '] .emoji-mode-tabs__btn{padding:0 6px!important;min-width:0!important;}',
+    /* 站点自己的位移是「轨道宽度的百分比」：轨道一旦从 200% 变 300%，
+       原来的 -50% 就变成 -1.5 屏，表情包栏会正好错开半屏。必须一起改。 */
+    '.composer-emoji-panel[' + SITE_READY + '] .emoji-swap[data-mode=sticker] .emoji-swap__track' +
+    '{transform:translate3d(-33.333333%,0,0)!important;}',
+    '.composer-emoji-panel[' + SITE_READY + '] .emoji-swap[' + SITE_MODE + '] .emoji-swap__track' +
+    '{transform:translate3d(-66.666667%,0,0)!important;}',
+    '.composer-emoji-panel[' + SITE_READY + '] .emoji-mode-tabs__indicator{width:calc(33.333333% - .12rem)!important;}',
+    '.composer-emoji-panel[' + SITE_READY + '] .emoji-mode-tabs[' + SITE_MODE + '] .emoji-mode-tabs__indicator' +
+    '{transform:translate3d(200%,0,0)!important;}',
 
-    '.hd{display:flex;align-items:center;gap:6px;padding:9px 10px;background:var(--bg2);',
-    '  border-bottom:1px solid var(--line);cursor:move;touch-action:none;flex:0 0 auto;}',
-    '.hd .t{font-weight:600;font-size:13px;flex:0 0 auto;white-space:nowrap;}',
-    '.hd .sp{flex:1 1 auto;min-width:4px;}',
-    '.ib{width:28px;height:28px;border-radius:8px;border:1px solid transparent;background:transparent;',
-    '  color:var(--fg2);font-size:15px;display:flex;align-items:center;justify-content:center;cursor:pointer;flex:0 0 auto;}',
-    '.ib:hover{background:rgba(128,128,128,.14);color:var(--fg);}',
-    '.ib.on{color:var(--brand);}',
-
-    '.bd{flex:1 1 auto;display:flex;flex-direction:column;min-height:0;}',
-
-    '.srch{display:flex;gap:6px;padding:9px 10px 6px;flex:0 0 auto;}',
-    '.srch input{flex:1 1 auto;min-width:0;height:34px;padding:0 10px;border-radius:9px;border:1px solid var(--line);',
-    '  background:var(--bg2);color:var(--fg);font-size:14px;outline:none;}',
-    '.srch input:focus{border-color:var(--brand);}',
-    '.btn{height:34px;padding:0 13px;border-radius:9px;border:0;background:var(--brand);color:#fff;',
-    '  font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;}',
-    '.btn:disabled{opacity:.5;cursor:not-allowed;}',
-    '.btn.gray{background:var(--bg2);color:var(--fg);border:1px solid var(--line);}',
-    '.btn.sm{height:28px;padding:0 10px;font-size:12px;}',
-
-    '.row{display:flex;align-items:center;gap:6px;padding:0 10px 8px;flex:0 0 auto;flex-wrap:wrap;}',
-    '.row select{height:28px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--fg);',
-    '  font-size:12px;padding:0 6px;outline:none;max-width:46%;}',
-
-    '.status{padding:0 10px 6px;font-size:11.5px;color:var(--fg2);flex:0 0 auto;min-height:16px;',
-    '  display:flex;align-items:center;gap:6px;}',
-    '.bar{height:3px;border-radius:2px;background:var(--line);overflow:hidden;margin:0 10px 6px;flex:0 0 auto;}',
-    '.bar i{display:block;height:100%;width:0;background:var(--brand);transition:width .18s;}',
-    '.bar.hidden{display:none;}',
-
-    '.grid{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:0 8px 8px;',
-    '  display:grid;grid-template-columns:repeat(3,1fr);gap:6px;align-content:start;-webkit-overflow-scrolling:touch;}',
-    '.grid.wide{grid-template-columns:repeat(4,1fr);}',
-    '.cell{position:relative;padding-top:100%;border-radius:9px;overflow:hidden;background:var(--bg2);',
-    '  border:2px solid transparent;cursor:pointer;}',
-    '.cell img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;}',
-    '.cell.sel{border-color:var(--brand);}',
-    '.cell .badge{position:absolute;left:3px;bottom:3px;background:rgba(0,0,0,.62);color:#fff;',
-    '  font-size:9.5px;padding:1px 4px;border-radius:4px;letter-spacing:.3px;}',
-    '.empty{grid-column:1/-1;text-align:center;color:var(--fg2);font-size:12.5px;padding:26px 8px;}',
-
-    '.ft{flex:0 0 auto;border-top:1px solid var(--line);background:var(--bg2);padding:7px 10px;',
-    '  display:flex;align-items:center;gap:8px;}',
-    '.ft .info{flex:1 1 auto;min-width:0;font-size:11.5px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
-
-    /* settings */
-    '.sheet{position:absolute;inset:0;background:var(--bg);display:flex;flex-direction:column;z-index:5;}',
-    '.sheet.hidden{display:none;}',
-    '.sheet .sh{display:flex;align-items:center;padding:9px 10px;border-bottom:1px solid var(--line);background:var(--bg2);}',
-    '.sheet .sh .t{font-weight:600;flex:1 1 auto;font-size:13px;}',
-    '.sheet .sc{flex:1 1 auto;overflow-y:auto;padding:10px 12px 20px;-webkit-overflow-scrolling:touch;}',
-    '.f{margin-bottom:13px;}',
-    '.f label{display:block;font-size:12px;color:var(--fg2);margin-bottom:4px;}',
-    '.f input[type=text],.f input[type=number],.f textarea{width:100%;padding:7px 9px;border-radius:8px;',
-    '  border:1px solid var(--line);background:var(--bg2);color:var(--fg);font-size:13px;outline:none;font-family:inherit;}',
-    '.f textarea{min-height:120px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.5;}',
-    '.sw{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px dashed var(--line);}',
-    '.sw span{font-size:12.5px;}',
-    '.sw input[type=checkbox]{width:38px;height:21px;-webkit-appearance:none;appearance:none;background:var(--line);',
-    '  border-radius:11px;position:relative;outline:none;cursor:pointer;transition:background .18s;flex:0 0 auto;}',
-    '.sw input[type=checkbox]:checked{background:var(--brand);}',
-    '.sw input[type=checkbox]::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;',
-    '  border-radius:50%;background:#fff;transition:transform .18s;}',
-    '.sw input[type=checkbox]:checked::after{transform:translateX(17px);}',
-    '.sw select{height:28px;max-width:56%;border-radius:8px;border:1px solid var(--line);background:var(--bg2);',
-    '  color:var(--fg);font-size:12px;padding:0 6px;outline:none;}',
-    '.hint{font-size:11px;color:var(--fg2);margin-top:4px;line-height:1.45;}',
-    '.logbox{width:100%;height:130px;overflow:auto;background:var(--bg2);border:1px solid var(--line);',
-    '  border-radius:8px;padding:6px 8px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;',
-    '  white-space:pre-wrap;word-break:break-all;color:var(--fg2);}',
-
-    '.rz{position:absolute;right:2px;bottom:2px;width:16px;height:16px;cursor:nwse-resize;z-index:6;opacity:.5;}',
-    '.rz::after{content:"";position:absolute;right:3px;bottom:3px;width:8px;height:8px;',
-    '  border-right:2px solid var(--fg2);border-bottom:2px solid var(--fg2);}',
-
-    '.toast{position:fixed;z-index:2147483002;left:50%;bottom:78px;transform:translateX(-50%);',
-    '  background:rgba(28,29,33,.93);color:#fff;font-size:12.5px;padding:8px 14px;border-radius:20px;',
-    '  max-width:82vw;text-align:center;opacity:0;transition:opacity .2s;pointer-events:none;}',
-    '.toast.on{opacity:1;}',
-    '@media(max-width:820px){.panel{max-width:94vw;}}'
+    /* —— 第三个 Tab。自带完整样式，站点改了作用域 id 也不会变成裸按钮 —— */
+    '.' + TAB_CLASS + '{position:relative;z-index:1;flex:1 1 0;height:1.75rem;margin:0;',
+    '  border:0;border-radius:999px;background:transparent;color:#64748b;font-size:.8rem;font-weight:600;',
+    '  font-family:inherit;line-height:1.75rem;cursor:pointer;transition:color .2s ease;',
+    '  -webkit-tap-highlight-color:transparent;}',
+    'html.dark .' + TAB_CLASS + '{color:#94a3b8;}',
+    /* 梗图栏激活时，把原生的「选中色」让给我的 Tab（原生激活态变回未选中灰） */
+    '.emoji-mode-tabs[' + SITE_MODE + '] .emoji-mode-tabs__btn--active{color:#64748b!important;}',
+    'html.dark .emoji-mode-tabs[' + SITE_MODE + '] .emoji-mode-tabs__btn--active{color:#94a3b8!important;}',
+    '.emoji-mode-tabs[' + SITE_MODE + '] .' + TAB_CLASS + '{color:#fff!important;}',
+    'html.dark .emoji-mode-tabs[' + SITE_MODE + '] .' + TAB_CLASS + '{color:#f1f5f9!important;}'
   ].join('\n');
+
+  /* ---------------------------------------------------------------
+   * 设计令牌 —— 全部从站点自己的 CSS 里抄的，不是猜的
+   *   面板：.chat-modal-panel / .chat-modal-overlay
+   *   开关：.toggle-switch / .toggle-switch-slider
+   *   深色：html.dark 下的 --zt-* 与 .chat-modal-* 覆盖
+   * 目的：脚本弹出来的东西跟站内弹窗是同一套视觉语言。
+   * 备注：--bd/--bg/--bg2/--fg/--fg2/--line/--brand 是梗图栏在用的老名字，保留。
+   * --------------------------------------------------------------- */
+  var VARS_FONT = 'HarmonyOS Sans,HarmonyOS Sans SC,PingFang SC,Microsoft YaHei,system-ui,-apple-system,sans-serif';
+
+  var VARS = [
+    '--bd:#e2e8f0;--bg:#fff;--bg2:#f8fafc;--fg:#0f172a;--fg2:#64748b;--line:#e2e8f0;--brand:#3b82f6;',
+    // 站点新增令牌
+    '--fg-strong:#1e293b;--fg3:#94a3b8;',
+    '--panel:#fff;--field:#fff;',
+    '--line-soft:rgba(148,163,184,.18);--bd-soft:rgba(148,163,184,.28);',
+    '--brand-h:#2563eb;--brand-a:#3b82f61a;--ring:#3b82f673;',
+    '--track:#e2e8f0;--track-on:#60a5fa;',
+    '--tool:rgba(148,163,184,.102);--tool-h:rgba(148,163,184,.18);',
+    '--btn2-bg:#fff;--btn2-fg:#64748b;--btn2-bd:rgba(148,163,184,.32);',
+    '--btn2-bg-h:rgba(148,163,184,.059);--btn2-fg-h:#475569;',
+    '--toast-bg:#1e293b;--toast-fg:#f1f5f9;',
+    // 站内 toast 的语义配色（浅色是 bg-*-100 + text-*-600，深色见下面 VARS_DARK）
+    '--tk-ok-bg:#d1fae5;--tk-ok-fg:#059669;',
+    '--tk-err-bg:#fee2e2;--tk-err-fg:#dc2626;',
+    '--tk-warn-bg:#fef9c3;--tk-warn-fg:#ca8a04;',
+    '--modal-sh:0 4px 6px #0f172a0a,0 20px 48px #0f172a24;',
+    '--scrim:#0f172a6b;--scrim-blur:6px;',
+    '--ease:cubic-bezier(.22,1,.36,1);--dur:.18s;'
+  ].join('');
+  var VARS_DARK = [
+    '--bd:#334155;--bg:transparent;--bg2:#1e293b;--fg:#e2e8f0;--fg2:#94a3b8;--line:#334155;--brand:#3b82f6;',
+    '--fg-strong:#f1f5f9;--fg3:#94a3b8;',
+    '--panel:#1e293b;--field:#0f172a;',
+    '--line-soft:rgba(148,163,184,.18);--bd-soft:rgba(148,163,184,.28);',
+    '--brand-h:#2563eb;--brand-a:#3b82f61a;--ring:#3b82f673;',
+    '--track:#475569;--track-on:#60a5fa;',
+    '--tool:rgba(51,65,85,.85);--tool-h:rgba(51,65,85,.96);',
+    '--btn2-bg:#0f172a;--btn2-fg:#cbd5e1;--btn2-bd:rgba(148,163,184,.28);',
+    '--btn2-bg-h:rgba(51,65,85,.9);--btn2-fg-h:#e2e8f0;',
+    '--toast-bg:#334155;--toast-fg:#f1f5f9;',
+    '--tk-ok-bg:rgba(6,78,59,.92);--tk-ok-fg:#6ee7b7;',
+    '--tk-err-bg:rgba(127,29,29,.92);--tk-err-fg:#fca5a5;',
+    '--tk-warn-bg:rgba(113,63,18,.92);--tk-warn-fg:#fcd34d;',
+    '--modal-sh:0 24px 60px #00000073;',
+    '--scrim:#020617b8;--scrim-blur:6px;',
+    '--ease:cubic-bezier(.22,1,.36,1);--dur:.18s;'
+  ].join('');
+
+  var PANE_CSS = [
+    '*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}',
+    '.root{display:flex;flex-direction:column;height:100%;min-height:0;padding:0 .2rem;',
+    '  font-family:' + VARS_FONT + ';',
+    '  font-size:13px;line-height:1.4;color:var(--fg);' + VARS + '}',
+    '.root.dark{' + VARS_DARK + '}',
+
+    '.bar{display:flex;gap:6px;flex:0 0 auto;}',
+    '.q{flex:1 1 auto;min-width:0;height:30px;padding:0 9px;border-radius:8px;border:1px solid var(--line);',
+    '  background:var(--bg2);color:var(--fg);font-size:13px;font-family:inherit;outline:none;}',
+    '.q:focus{border-color:var(--brand);}',
+
+    '.go{flex:0 0 auto;height:30px;padding:0 13px;border:0;border-radius:8px;background:var(--brand);color:#fff;',
+    '  font-size:12.5px;font-weight:600;font-family:inherit;cursor:pointer;white-space:nowrap;}',
+    '.go:disabled{opacity:.5;cursor:not-allowed;}',
+
+    '.bar2{display:flex;align-items:center;gap:5px;margin-top:5px;flex:0 0 auto;}',
+    '.src{flex:0 1 auto;min-width:0;height:24px;max-width:44%;padding:0 4px;border-radius:6px;',
+    '  border:1px solid var(--line);background:var(--bg2);color:var(--fg);font-size:11px;font-family:inherit;outline:none;}',
+    '.mini{flex:0 0 auto;height:24px;padding:0 7px;border:1px solid var(--line);border-radius:6px;',
+    '  background:var(--bg2);color:var(--fg);font-size:11px;font-family:inherit;cursor:pointer;white-space:nowrap;}',
+    '.mini:active{background:var(--bd);}',
+    '.mini.ic{padding:0;width:24px;font-size:13px;line-height:1;}',
+    '.sp{flex:1 1 auto;min-width:2px;}',
+
+    '.st{margin-top:4px;flex:0 0 auto;font-size:10.5px;color:var(--fg2);height:14px;overflow:hidden;',
+    '  white-space:nowrap;text-overflow:ellipsis;}',
+    '.pb{margin-top:3px;height:3px;border-radius:2px;background:var(--line);overflow:hidden;flex:0 0 auto;}',
+    '.pb i{display:block;height:100%;width:0;background:var(--brand);transition:width .18s;}',
+    '.pb.off{visibility:hidden;}',
+
+    '.ft{display:flex;align-items:center;gap:8px;margin-top:5px;flex:0 0 auto;}',
+    '.ft.off{display:none;}',
+    '.ft .fi{flex:1 1 auto;min-width:0;font-size:11px;color:var(--fg2);overflow:hidden;',
+    '  text-overflow:ellipsis;white-space:nowrap;}',
+
+    /* 缩略图尺寸：梗图栏只有百来像素高，格子一大会连一行半都放不下。
+       用 auto-fill + 下限而不是写死列数 —— 不论面板多宽，格子都稳定落在
+       下限附近（~70px），一屏能看到 2~3 行；面板变宽只会多出列，不会变大。
+       想再大/再小改 --ztm-thumb（设置里有「缩略图最小边」）。 */
+    '.grid{flex:1 1 auto;min-height:0;margin-top:5px;overflow-x:hidden;overflow-y:auto;',
+    '  overscroll-behavior:contain;-webkit-overflow-scrolling:touch;',
+    '  display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--ztm-thumb,68px),1fr));',
+    '  grid-auto-rows:max-content;gap:5px;align-content:start;}',
+    '.grid::-webkit-scrollbar{width:0;height:0;}',
+    // 那条 1px 描边用 inset box-shadow 画，不用 border：
+    // 格子高度靠 padding-top:100% 撑起来，而百分比是相对**包含块宽度**算的，
+    // 一旦有 border，高度就比宽度多出 2px，格子不再是正方形（真机实测 75.1×77.2）。
+    '.cell{position:relative;width:100%;padding:0;padding-top:100%;border:0;border-radius:8px;',
+    '  background:var(--bg2);overflow:hidden;cursor:pointer;box-shadow:inset 0 0 0 1px var(--line);',
+    '  -webkit-tap-highlight-color:transparent;touch-action:manipulation;}',
+    '.cell>img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;',
+    '  pointer-events:none;}',
+    '.cell.on{box-shadow:inset 0 0 0 2px var(--brand);}',
+    '.cell.busy{opacity:.45;pointer-events:none;}',
+    '.tg{position:absolute;left:3px;bottom:3px;padding:0 3px;border-radius:3px;background:rgba(0,0,0,.6);',
+    '  color:#fff;font-size:9px;letter-spacing:.3px;}',
+    '.m2{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;',
+    '  background:rgba(0,0,0,.42);color:#fff;font-size:10px;text-align:center;padding:2px;}',
+    '.empty{grid-column:1/-1;padding:18px 6px;text-align:center;color:var(--fg2);font-size:11.5px;line-height:1.6;}'
+  ].join('\n');
+
+  /* 覆盖层样式：toast + 设置面板
+     整套是照着站点自己的 .chat-modal-* / .toggle-switch / html.dark 的 --zt-* 抄的，
+     所以字号、圆角、阴影、动效曲线都跟站内弹窗一致。 */
+  var OV_CSS = [
+    '*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}',
+    '.ov{font-family:' + VARS_FONT + ';',
+    '  font-size:14px;line-height:1.5;color:var(--fg);' + VARS + '}',
+    '.ov.dark{' + VARS_DARK + '}',
+
+    /* toast —— 站内 .toast 的浮起位移 + 深色底（#1e293b） */
+    '.toast{position:fixed;z-index:2147483600;left:50%;top:1rem;transform:translate(-50%,-8px) scale(.96);',
+    '  max-width:84vw;padding:.5rem .875rem;border-radius:12px;border:1px solid var(--line-soft);',
+    '  background:var(--toast-bg);color:var(--toast-fg);box-shadow:0 12px 32px rgba(15,23,42,.16);',
+    '  font-size:.8125rem;line-height:1.45;text-align:center;opacity:0;pointer-events:none;',
+    '  transition:opacity .25s ease,transform .25s ease;}',
+    '.toast.on{opacity:1;transform:translate(-50%) scale(1);}',
+    /* 语义配色与站内一起（bg-emerald/red/yellow-100 + 深色变体） */
+    '.toast[data-kind=ok]{background:var(--tk-ok-bg);color:var(--tk-ok-fg);border-color:transparent;}',
+    '.toast[data-kind=err]{background:var(--tk-err-bg);color:var(--tk-err-fg);border-color:transparent;}',
+    '.toast[data-kind=warn]{background:var(--tk-warn-bg);color:var(--tk-warn-fg);border-color:transparent;}',
+
+    /* 遮罩 —— 站内 .chat-modal-overlay：rgba(15,23,42,.42) + blur(6px) */
+    '.mask{position:fixed;z-index:2147483601;inset:0;background:var(--scrim);',
+    '  display:flex;align-items:center;justify-content:center;padding:1.5rem;',
+    '  -webkit-backdrop-filter:blur(var(--scrim-blur));backdrop-filter:blur(var(--scrim-blur));}',
+    '.mask.off{display:none;}',
+
+    /* 面板 —— 站内 .chat-modal-panel：22px 圆角 + 双层投影，无描边。
+       宽度取 400px，正是站内最宽的那个弹窗（.chat-modal-panel--alert），
+       比表单弹窗(360px)宽一点，因为这里要放 JSON 文本域和长提示。 */
+    '.sheet{width:100%;max-width:400px;max-height:84vh;display:flex;flex-direction:column;',
+    '  background:var(--panel);border-radius:22px;overflow:hidden;box-shadow:var(--modal-sh);',
+    '  will-change:transform,opacity;animation:ztm-pop .32s var(--ease);}',
+    '@keyframes ztm-pop{from{opacity:0;transform:translate3d(0,10px,0) scale(.98);}}',
+
+    /* 头 —— 站内 .chat-modal-header / .chat-modal-heading */
+    '.sh{display:flex;align-items:center;flex:0 0 auto;gap:.5rem;padding:1.125rem 1.25rem .75rem;',
+    '  border-bottom:1px solid var(--line-soft);}',
+    '.sh .t{flex:1 1 auto;font-size:1.0625rem;font-weight:600;color:var(--fg-strong);}',
+    '.sh .ver{font-size:.6875rem;font-weight:400;color:var(--fg3);}',
+    /* 关闭 —— 站内 .chat-modal-close（32×32 / 10px 圆角 / 灰底） */
+    '.x{flex:0 0 auto;width:32px;height:32px;border:0;border-radius:10px;background:var(--tool);',
+    '  color:var(--fg2);font-size:.875rem;line-height:1;font-family:inherit;cursor:pointer;',
+    '  display:flex;align-items:center;justify-content:center;',
+    '  transition:background var(--dur) ease,color var(--dur) ease;}',
+    '.x:hover{background:var(--tool-h);color:var(--btn2-fg-h);}',
+
+    '.sc{flex:1 1 auto;min-height:0;overflow-y:auto;padding:.25rem 1.25rem 1rem;',
+    '  overscroll-behavior:contain;-webkit-overflow-scrolling:touch;}',
+
+    /* 字段 —— 站内 .chat-modal-label / .chat-modal-textarea / .chat-modal-field-hint */
+    '.f{margin-bottom:1rem;}',
+    '.f>label{display:block;margin-bottom:.375rem;font-size:.75rem;font-weight:500;color:var(--fg2);}',
+    '.f input[type=text],.f input[type=number],.f textarea,.sw select{padding:.5rem .625rem;',
+    '  border:1px solid var(--bd-soft);border-radius:10px;background:var(--field);color:var(--fg);',
+    '  font-size:.8125rem;line-height:1.5;font-family:inherit;outline:none;',
+    '  transition:border-color var(--dur) ease,box-shadow var(--dur) ease;}',
+    '.f input[type=text],.f textarea{width:100%;}',
+    '.f input::placeholder,.f textarea::placeholder{color:#cbd5e1;}',
+    '.f input[type=text]:focus,.f input[type=number]:focus,.f textarea:focus,.sw select:focus{',
+    '  border-color:var(--ring);box-shadow:0 0 0 3px var(--brand-a);}',
+    '.f textarea{min-height:120px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;',
+    '  font-size:.75rem;}',
+
+    /* 开关行 —— 站内 .toggle-switch 的那套（40×22 轨道 + 16px 圆钮） */
+    '.sw{display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.5625rem 0;}',
+    '.f>.sw+.sw{border-top:1px solid var(--line-soft);}',
+    '.sw>.lbl{font-size:.8125rem;color:var(--fg);}',
+    // 下拉让它自己长：手机上面板只有 358px，写死 56% 会把「静态 WebP（只留首帧）」
+    // 这种长选项截掉半句。给它 flex:1 + min-width:0，标签让位，它就能整句显示。
+    '.sw select{width:auto;max-width:none;flex:1 1 auto;min-width:0;}',
+    '.sw input[type=number]{width:88px;flex:0 0 auto;}',
+    '.tgl{position:relative;display:inline-block;flex:0 0 auto;width:40px;height:22px;cursor:pointer;}',
+    '.tgl input{position:absolute;opacity:0;width:0;height:0;}',
+    '.tgl-s{position:absolute;inset:0;border-radius:999px;background:var(--track);',
+    '  transition:background-color .2s ease;}',
+    '.tgl-s:before{content:"";position:absolute;left:3px;top:3px;width:16px;height:16px;border-radius:50%;',
+    '  background:#fff;box-shadow:0 1px 3px #0f172a1f;transition:transform .2s ease;}',
+    '.tgl input:checked+.tgl-s{background-color:var(--track-on);}',
+    '.tgl input:checked+.tgl-s:before{transform:translate(18px);}',
+    '.tgl input:focus-visible+.tgl-s{box-shadow:0 0 0 3px var(--brand-a);}',
+
+    '.hint{margin:.375rem 0 0;font-size:.6875rem;line-height:1.45;color:var(--fg3);}',
+    '.btns{display:flex;gap:.5rem;margin-top:.75rem;flex-wrap:wrap;}',
+
+    /* 按钮 —— 站内 .chat-modal-btn（primary #3b82f6→#2563eb / secondary 白底描边）。
+       注意别写 line-height：站内是 Tailwind preflight 的 html{line-height:1.5} +
+       button{line-height:inherit}，自己定一个会让按钮比站内矮 4px。 */
+    '.b{flex:0 1 auto;padding:.625rem 1rem;border:0;border-radius:12px;background:var(--brand);color:#fff;',
+    '  font-size:.875rem;font-weight:500;line-height:inherit;font-family:inherit;cursor:pointer;white-space:nowrap;',
+    '  transition:background var(--dur) ease,color var(--dur) ease,border-color var(--dur) ease,opacity var(--dur) ease;}',
+    '.b:hover{background:var(--brand-h);}',
+    '.b:active{opacity:.9;}',
+    '.b:disabled{opacity:.55;cursor:not-allowed;}',
+    '.b.gray{background:var(--btn2-bg);color:var(--btn2-fg);border:1px solid var(--btn2-bd);}',
+    '.b.gray:hover{background:var(--btn2-bg-h);color:var(--btn2-fg-h);}',
+
+    /* 底部动作条 —— 站内 .chat-modal-actions */
+    '.sf{display:flex;gap:.625rem;flex:0 0 auto;padding:.875rem 1.25rem 1.125rem;',
+    '  border-top:1px solid var(--line-soft);}',
+    '.sf .b{flex:1 1 0;min-width:0;}',
+
+    '.logbox{width:100%;height:130px;overflow:auto;padding:.5rem .625rem;border-radius:10px;',
+    '  border:1px solid var(--bd-soft);background:var(--field);color:var(--fg2);',
+    '  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.6875rem;line-height:1.5;',
+    '  white-space:pre-wrap;word-break:break-all;}',
+
+    /* 移动端 —— 站内把遮罩内边距收到 1rem、模糊降到 4px */
+    '@media (max-width:480px){.mask{padding:1rem;--scrim-blur:4px;}.sheet{max-height:88vh;}}',
+    '@media (prefers-reduced-motion: reduce){',
+    '  .toast,.sheet,.b,.x,.tgl-s,.tgl-s:before{transition:none!important;animation:none!important;}}'
+  ].join('\n');
+
+  /* ---------- 主题跟随站点（站点是给 <html> 加 .dark） ---------- */
+
+  function isDark() {
+    try {
+      return !!(document.documentElement && document.documentElement.classList &&
+        document.documentElement.classList.contains('dark'));
+    } catch (e) { return false; }
+  }
+
+  function applyTheme() {
+    var d = isDark();
+    if (ui.pane && ui.pane.__ztmRoot) ui.pane.__ztmRoot.classList[d ? 'add' : 'remove']('dark');
+    if (ui.ovRoot) ui.ovRoot.classList[d ? 'add' : 'remove']('dark');
+  }
+
+  /**
+   * 把可调的显示项以 CSS 自定义属性喂进梗图栏。
+   * 挂在 pane 元素上：自定义属性会穿过影子边界继承给里面的 .grid，
+   * 而 pane 是我们自己插进去的节点，Vue 重渲染不会碰它。
+   */
+  function applyPaneVars() {
+    if (!ui.pane || !ui.pane.style || typeof ui.pane.style.setProperty !== 'function') return;
+    var n = Number(settings.thumbMin);
+    if (!isFinite(n) || n <= 0) n = 68;
+    n = Math.max(44, Math.min(160, n));
+    ui.pane.style.setProperty('--ztm-thumb', n + 'px');
+  }
+
+  /* ---------- 影子根工具 ---------- */
+
+  function makeShadow(host, css) {
+    var root = null;
+    if (host && host.attachShadow) {
+      try { root = host.attachShadow({ mode: 'open' }); } catch (e) { root = null; }
+    }
+    if (!root) root = host;                       // 极老内核：退化为普通子节点
+    var st = document.createElement('style');
+    st.textContent = css;
+    root.appendChild(st);
+    return root;
+  }
+
+  function ensureSiteCss() {
+    if (document.getElementById(PREFIX + '-site-css')) return;
+    var st = document.createElement('style');
+    st.id = PREFIX + '-site-css';
+    st.textContent = SITE_CSS;
+    (document.head || document.documentElement).appendChild(st);
+  }
+
+  /* =========================================================================
+   * 梗图栏 UI（影子根，与站点样式完全隔离）
+   * =======================================================================*/
+
+  function paneHtml() {
+    return [
+      '<div class="root">',
+      '  <div class="bar">',
+      '    <input class="q" type="search" autocomplete="off" enterkeyhint="search" placeholder="搜索梗图，如：猫 / 无语 / 哈哈">',
+      '    <button class="go" data-a="search" type="button">搜索</button>',
+      '  </div>',
+      '  <div class="bar2">',
+      '    <select class="src" data-a="source"></select>',
+      '    <button class="mini" data-a="next" type="button">换一批</button>',
+      '    <button class="mini" data-a="url" type="button">链接</button>',
+      '    <button class="mini" data-a="file" type="button">本地</button>',
+      '    <div class="sp"></div>',
+      '    <button class="mini ic" data-a="cfg" type="button" title="设置" aria-label="设置">⚙</button>',
+      '  </div>',
+      '  <div class="st"></div>',
+      '  <div class="pb off"><i></i></div>',
+      '  <div class="ft off">',
+      '    <div class="fi">就绪</div>',
+      '    <button class="go" data-a="send" type="button" disabled>发送</button>',
+      '  </div>',
+      '  <div class="grid"><div class="empty">输入关键词，搜索网络梗图<br>点一下即可发到聊天</div></div>',
+      '</div>'
+    ].join('\n');
+  }
+
+  function buildPaneUi(pane) {
+    var root = makeShadow(pane, PANE_CSS);
+    var box = document.createElement('div');
+    box.innerHTML = paneHtml();
+    var wrap = box.firstChild;
+    root.appendChild(wrap);
+    pane.__ztmRoot = wrap;
+
+    ui.els.root = wrap;
+    ui.els.input = wrap.querySelector('.q');
+    ui.els.grid = wrap.querySelector('.grid');
+    ui.els.status = wrap.querySelector('.st');
+    ui.els.bar = wrap.querySelector('.pb');
+    ui.els.sourceSel = wrap.querySelector('[data-a="source"]');
+    ui.els.send = wrap.querySelector('[data-a="send"]');
+    ui.els.foot = wrap.querySelector('.ft');
+    ui.els.footInfo = wrap.querySelector('.fi');
+
+    // 面板在站点里是浮在输入区上方的，软键盘弹起/收起时不需要我们插手，
+    // 但输入必须阻止冒泡：站点在 document 上挂了若干全局键盘/手势监听。
+    function swallow(ev) { ev.stopPropagation(); }
+    ['keydown', 'keyup', 'keypress', 'pointerdown', 'click', 'contextmenu', 'selectstart']
+      .forEach(function (t) { wrap.addEventListener(t, swallow); });
+
+    wrap.addEventListener('click', function (ev) {
+      var t = ev.target;
+      var el = t && t.closest ? t.closest('[data-a]') : null;
+      if (el) {
+        var act = el.getAttribute('data-a');
+        switch (act) {
+          case 'search': doSearch(1); return;
+          case 'next': doSearch((state.page || 1) + 1); return;
+          case 'url': sendFromUrl(); return;
+          case 'file': sendFromFile(); return;
+          case 'send': sendSelected(); return;
+          case 'cfg': openSettings(); return;
+          default: return;
+        }
+      }
+      var cell = t && t.closest ? t.closest('.cell') : null;
+      if (cell && cell.getAttribute('data-url')) pickCell(cell);
+    });
+
+    if (ui.els.input) {
+      ui.els.input.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); doSearch(1); }
+      });
+    }
+    if (ui.els.sourceSel) {
+      ui.els.sourceSel.addEventListener('change', function () { state.sourceId = ui.els.sourceSel.value; });
+    }
+
+    // 下拉里的选项要在建 UI 时就填好。之前只在「保存设置 / 恢复默认」时填，
+    // 结果是刚装好脚本、还没进过设置页的用户，源下拉是个空框。
+    renderSources();
+
+    applyPaneVars();
+    applyTheme();
+  }
+
+  /* =========================================================================
+   * 注入：给站点的表情面板补第三个 Tab
+   * =======================================================================*/
+
+  function scopeAttrOf(el) {
+    var attrs = el && el.attributes;
+    if (!attrs) return null;
+    for (var i = 0; i < attrs.length; i++) {
+      var n = attrs[i].name;
+      if (SCOPE_RE.test(n)) return n;
+    }
+    return null;
+  }
+
+  function makeTab(scope) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('role', 'tab');
+    b.setAttribute('aria-label', '梗图搜索');
+    b.setAttribute('aria-selected', 'false');
+    // 带上站点的作用域属性 → 原生 tab 的样式直接生效；同时用自己的 class 兜底
+    b.className = 'emoji-mode-tabs__btn ' + TAB_CLASS;
+    if (scope) b.setAttribute(scope, '');
+    b.textContent = '梗图';
+    return b;
+  }
+
+  function makePane(scope) {
+    var d = document.createElement('div');
+    d.setAttribute('role', 'tabpanel');
+    d.setAttribute('aria-label', '梗图搜索');
+    d.className = 'emoji-swap__pane ' + PANE_CLASS;
+    if (scope) d.setAttribute(scope, '');
+    return d;
+  }
+
+  /**
+   * 把梗图 Tab / 梗图栏插进站点表情面板。幂等，可以反复调用。
+   * @returns {boolean} 是否已就绪
+   */
+  function ensureInjected() {
+    var panel = document.querySelector('.composer-emoji-panel');
+    if (!panel) { ui.panel = null; return false; }
+
+    // 快路径：已经插好了就别再动 DOM（MutationObserver 会被自己的写入触发）
+    if (ui.panel === panel && ui.tab && ui.pane &&
+      ui.tab.parentNode === ui.tabs && ui.pane.parentNode === ui.track) return true;
+
+    var tabs = panel.querySelector('.emoji-mode-tabs');
+    var track = panel.querySelector('.emoji-swap__track');
+    if (!tabs || !track) return false;
+    var swap = track.parentNode;
+
+    ensureSiteCss();
+    var scope = scopeAttrOf(tabs) || scopeAttrOf(panel);
+
+    ui.panel = panel; ui.tabs = tabs; ui.track = track; ui.swap = swap;
+
+    var tab = tabs.querySelector('.' + TAB_CLASS);
+    if (!tab) {
+      tab = makeTab(scope);
+      tabs.appendChild(tab);
+      // 站点切换自己那两个 Tab 时，把梗图栏让出去
+      tabs.addEventListener('click', function (ev) {
+        var t = ev.target;
+        var b = t && t.closest ? t.closest('.emoji-mode-tabs__btn') : null;
+        if (b && b !== ui.tab) setMemeMode(false);
+      }, true);
+    } else if (scope && !scopeAttrOf(tab)) {
+      tab.setAttribute(scope, '');
+    }
+    ui.tab = tab;
+
+    var pane = track.querySelector('.' + PANE_CLASS);
+    if (!pane) {
+      pane = makePane(scope);
+      track.appendChild(pane);
+      buildPaneUi(pane);
+      try { tab.addEventListener('click', function () { setMemeMode(true); }); } catch (e) { /* ignore */ }
+    } else if (scope && !scopeAttrOf(pane)) {
+      pane.setAttribute(scope, '');
+    }
+    ui.pane = pane;
+
+    panel.setAttribute(SITE_READY, '');
+    applyPaneVars();
+    applyTheme();
+    setMemeMode(ui.active);
+    return true;
+  }
+
+  function setMemeMode(on) {
+    if (!ui.tabs || !ui.swap || !ui.tab || !ui.pane) return;
+    ui.active = !!on;
+    var mark = on ? '' : null;
+    if (on) {
+      ui.tabs.setAttribute(SITE_MODE, mark);
+      ui.swap.setAttribute(SITE_MODE, mark);
+    } else {
+      ui.tabs.removeAttribute(SITE_MODE);
+      ui.swap.removeAttribute(SITE_MODE);
+    }
+    ui.tab.setAttribute('aria-selected', on ? 'true' : 'false');
+    ui.tab.classList[on ? 'add' : 'remove']('on');
+
+    // 让原生的两栏在梗图模式下不可聚焦
+    var panes = ui.track.children;
+    for (var i = 0; i < panes.length; i++) {
+      var p = panes[i];
+      if (!p || p === ui.pane || !p.removeAttribute) continue;
+      if (on) p.setAttribute('inert', '');
+      else p.removeAttribute('inert');
+    }
+  }
+
+  /** 展开站点表情面板并切到梗图栏（GM 菜单/兜底入口用） */
+  function openMemeTab() {
+    ensureInjected();
+    if (!ui.tab) { toast('请先进入一个聊天房间', 'error'); return; }
+    var panel = document.querySelector('.composer-emoji-panel');
+    var open = !!(panel && panel.classList && panel.classList.contains('composer-emoji-panel--open'));
+    if (!open) {
+      var btn = document.querySelector('.composer-tool[aria-label="表情"]');
+      if (btn && btn.click) btn.click();
+    }
+    setMemeMode(true);
+    // 面板展开有 .3s 过渡，DOM 可能在动画后又重建一次
+    setTimeout(function () { ensureInjected(); setMemeMode(true); }, 380);
+  }
+
+  /* =========================================================================
+   * 覆盖层：toast + 设置面板
+   * =======================================================================*/
+
+  function buildOverlay() {
+    if (ui.host) return;
+    var host = document.createElement('div');
+    host.id = PREFIX + '-host';
+    // 挂 <html> 而不是 <body>：站点若给 body 加 transform/filter，
+    // 会变成 fixed 的包含块，导致定位跑偏
+    host.style.cssText = 'all:initial;position:static;';
+    (document.documentElement || document.body).appendChild(host);
+
+    var root = makeShadow(host, OV_CSS);
+    var box = document.createElement('div');
+    box.className = 'ov';
+    box.innerHTML = [
+      '<div class="mask off">',
+      '  <div class="sheet" role="dialog" aria-label="梗图助手设置">',
+      '    <div class="sh"><div class="t">梗图助手设置 <span class="ver">v' + VERSION + '</span></div>',
+      '      <button class="x" data-a="close-settings" type="button" aria-label="关闭">✕</button></div>',
+      '    <div class="sc">',
+      '      <div class="f"><label>服务端地址</label><input type="text" data-k="baseUrl"></div>',
+      '      <div class="f"><label>图片代理前缀（无 GM 通道时用于绕过跨域）</label>',
+      '        <input type="text" data-k="imageProxy" placeholder="https://wsrv.nl/?url=">',
+      '        <div class="hint">留空表示直连。代理会把图片转成可跨域读取的响应。</div></div>',
+      '      <div class="f"><label>压缩</label>',
+      '        <div class="sw"><span class="lbl">自动压缩超限图片</span>',
+      '          <label class="tgl"><input type="checkbox" data-k="autoCompress"><span class="tgl-s"></span></label></div>',
+      '        <div class="sw"><span class="lbl">超过此大小(MB)开始压缩</span><input type="number" data-k="compressOverMB" min="1" max="20" step="0.5"></div>',
+      '        <div class="sw"><span class="lbl">最长边(px)</span><input type="number" data-k="maxDimension" min="320" max="4096" step="80"></div>',
+      '      </div>',
+      '      <div class="f"><label>GIF → WebP</label>',
+      '        <div class="sw"><span class="lbl">转换模式</span>',
+      '          <select data-k="gifToWebp">',
+      '            <option value="static">静态 WebP（只留首帧）</option>',
+      '            <option value="anim">动图 WebP（保留动画）</option>',
+      '            <option value="off">关闭，原样发送 GIF</option>',
+      '          </select></div>',
+      '        <div class="sw"><span class="lbl">最长边(px)</span><input type="number" data-k="webpMaxDim" min="160" max="2048" step="80"></div>',
+      '        <div class="sw"><span class="lbl">质量 (0.5–1)</span><input type="number" data-k="webpQuality" min="0.5" max="1" step="0.05"></div>',
+      '        <div class="hint">默认「静态 WebP」：只取首帧，体积最小，而且不依赖内核支持，任何环境都能转。选「动图 WebP」可以保留动画，但它需要内核用 ImageDecoder 逐帧解码再自封装成动图容器（Chrome / 安卓 WebView 94+），内核不支持时会自动降级为静态首帧并明确提示。质量默认 0.70：实测 q=0.9 时产出反而是原 GIF 的 1.5~2 倍（GIF 每帧只存变化区域，WebP 每帧是整幅有损编码），q≈0.7 才稳定压到 0.5~0.85 倍。</div>',
+      '      </div>',
+      '      <div class="f"><label>显示</label>',
+      '        <div class="sw"><span class="lbl">缩略图最小边(px)</span><input type="number" data-k="thumbMin" min="44" max="120" step="4"></div>',
+      '        <div class="hint">梗图栏只有百来像素高，格子越大一屏能看到的越少。默认 68：每行 4 张、一屏能完整看到 2 行。格子会自动铺满整行，所以实际尺寸会比这个值略大，而且随面板宽度分档（不是精确像素）——按 4px 慢慢调看不出变化，一次跳 10~20 才会换档。</div>',
+      '      </div>',
+      '      <div class="f"><label>交互</label>',
+      '        <div class="sw"><span class="lbl">点击梗图直接发送（关闭后先选中再点「发送」）</span>',
+      '          <label class="tgl"><input type="checkbox" data-k="tapSend"><span class="tgl-s"></span></label></div>',
+      '      </div>',
+      '      <div class="f"><label>表情源（JSON 数组，可增删）</label>',
+      '        <textarea data-k="sources"></textarea>',
+      '        <div class="hint">html 源：url 支持 {kw} {page}，pattern 为正则字符串，exclude 为可选的排除正则；json 源：额外用 path（如 data.list[].url）取图。</div>',
+      '        <div class="btns">',
+      '          <button class="b gray" data-a="reset-sources" type="button">恢复内置源</button>',
+      '          <button class="b gray" data-a="test-src" type="button">测试当前源</button>',
+      '        </div>',
+      '      </div>',
+      '      <div class="f"><label>调试</label>',
+      '        <div class="sw"><span class="lbl">输出调试日志到控制台</span>',
+      '          <label class="tgl"><input type="checkbox" data-k="showLog"><span class="tgl-s"></span></label></div>',
+      '        <div class="logbox" data-k="log"></div>',
+      '        <div class="btns">',
+      '          <button class="b gray" data-a="copy-log" type="button">复制日志</button>',
+      '          <button class="b gray" data-a="clear-log" type="button">清空</button>',
+      '        </div>',
+      '      </div>',
+      '      <div class="hint">上传链路：POST /api/upload/presign → PUT OSS → POST /api/upload/bind → WS message(type=image)，与官方客户端一致。</div>',
+      '    </div>',
+      '    <div class="sf">',
+      '      <button class="b gray" data-a="close-settings" type="button">取消</button>',
+      '      <button class="b" data-a="save" type="button">保存设置</button>',
+      '    </div>',
+      '  </div>',
+      '</div>',
+      '<div class="toast"></div>'
+    ].join('\n');
+    root.appendChild(box);
+
+    ui.host = host;
+    ui.shadow = root;
+    ui.ovRoot = box;
+    ui.els.sheet = box.querySelector('.mask');
+    ui.els.toast = box.querySelector('.toast');
+    ui.els.logBox = box.querySelector('.logbox');
+
+    box.addEventListener('click', function (ev) {
+      var t = ev.target;
+      var el = t && t.closest ? t.closest('[data-a]') : null;
+      if (!el) return;
+      switch (el.getAttribute('data-a')) {
+        case 'close-settings': closeSettings(); break;
+        case 'save': commitSettings(); break;
+        case 'reset-sources': resetSources(); break;
+        case 'test-src': testSource(); break;
+        case 'copy-log': copyLog(); break;
+        case 'clear-log': logBuf.length = 0; if (ui.els.logBox) ui.els.logBox.textContent = ''; break;
+        default: break;
+      }
+    });
+    // 点遮罩空白处关闭
+    if (ui.els.sheet) {
+      ui.els.sheet.addEventListener('click', function (ev) {
+        if (ev.target === ui.els.sheet) closeSettings();
+      });
+    }
+
+    applyTheme();
+  }
+
+  function buildUI() {
+    buildOverlay();
+
+    ensureInjected();
+    ensureSiteCss();
+    applyTheme();
+
+    // 房间切换 / SPA 路由会让站点重建 composer；主题也会变。
+    // 用 rAF 节流，避免跟站的 DOM 写入互相触发。
+    if (typeof MutationObserver === 'function') {
+      try {
+        var pending = false;
+        var obs = new MutationObserver(function () {
+          if (pending) return;
+          pending = true;
+          setTimeout(function () { pending = false; ensureInjected(); applyTheme(); }, 120);
+        });
+        obs.observe(document.documentElement || document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+      } catch (e) { /* ignore */ }
+    }
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('resize', function () { ensureInjected(); });
+    }
+    syncSettingsForm();
+  }
+
+  /* ---------- 反馈 ---------- */
 
   var toastTimer = null;
 
   function toast(msg, kind) {
-    if (!ui.shadow) return;
     var el = ui.els.toast;
-    if (!el) return;
+    if (!el) { log('[toast] ' + msg); return; }
     el.textContent = msg;
-    el.style.background = kind === 'error' ? 'rgba(190,32,32,.95)'
-      : kind === 'ok' ? 'rgba(20,130,60,.95)'
-        : kind === 'warn' ? 'rgba(196,120,10,.95)' : 'rgba(28,29,33,.93)';
+    // 配色交给 CSS（对齐站内 toast 的语义色），不再写内联样式，
+    // 这样深色模式能自动跟着 --tk-* 令牌走。
+    var k = kind === 'error' ? 'err' : (kind === 'ok' || kind === 'warn') ? kind : '';
+    if (k) { if (el.setAttribute) el.setAttribute('data-kind', k); }
+    else if (el.removeAttribute) el.removeAttribute('data-kind');
     el.classList.add('on');
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { el.classList.remove('on'); }, 2400);
@@ -1500,413 +2095,52 @@
 
   function setStatus(text) {
     if (ui.els.status) ui.els.status.textContent = text || '';
+    if (ui.els.footInfo) ui.els.footInfo.textContent = text || '';
   }
 
   function setProgress(p) {
-    if (!ui.els.bar) return;
-    if (p == null) { ui.els.bar.classList.add('hidden'); ui.els.bar.firstChild.style.width = '0'; return; }
-    ui.els.bar.classList.remove('hidden');
-    ui.els.bar.firstChild.style.width = Math.round(Math.max(0, Math.min(1, p)) * 100) + '%';
+    var bar = ui.els.bar;
+    if (!bar) return;
+    if (p == null) { bar.classList.add('off'); if (bar.firstChild) bar.firstChild.style.width = '0'; return; }
+    bar.classList.remove('off');
+    if (bar.firstChild) bar.firstChild.style.width = Math.round(Math.max(0, Math.min(1, p)) * 100) + '%';
   }
 
-  var state = {
-    query: '', page: 1, results: [], selected: null, busy: false, sourceId: null
-  };
-
-  function buildUI() {
-    if (ui.host) return;
-
-    var host = document.createElement('div');
-    host.id = PREFIX + '-host';
-    // 挂到 <html> 而不是 <body>：站点若给 body 加了 transform/filter，
-    // 会变成 fixed 的包含块，导致悬浮窗定位（进而命中区域）跑偏。
-    host.style.cssText = 'all:initial;position:static;';
-    (document.documentElement || document.body).appendChild(host);
-    var shadow = host.attachShadow ? host.attachShadow({ mode: 'open' }) : null;
-    if (!shadow) {
-      // 极老内核没有 shadow DOM，退化为普通挂载
-      shadow = host;
-      var st = document.createElement('style');
-      st.textContent = '#ztm-host ' + CSS.replace(/\n/g, '\n#ztm-host ');
-      document.head.appendChild(st);
-    } else {
-      var st2 = document.createElement('style');
-      st2.textContent = CSS;
-      shadow.appendChild(st2);
-    }
-
-    var wrap = document.createElement('div');
-    wrap.className = 'wrap' + (settings.theme === 'dark' ||
-      (settings.theme === 'auto' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? ' dark' : '');
-    shadow.appendChild(wrap);
-
-    wrap.innerHTML = [
-      '<button class="fab" type="button" title="表情包助手">😊</button>',
-      '<div class="panel hidden" role="dialog" aria-label="表情包助手">',
-      '  <div class="hd">',
-      '    <div class="t">表情包 <span style="opacity:.55;font-size:10.5px">v' + VERSION + '</span></div>',
-      '    <div class="sp"></div>',
-      '    <button class="ib" data-act="wide" title="列数">▦</button>',
-      '    <button class="ib" data-act="theme" title="主题">◐</button>',
-      '    <button class="ib" data-act="settings" title="设置">⚙</button>',
-      '    <button class="ib" data-act="min" title="收起">—</button>',
-      '  </div>',
-      '  <div class="bd">',
-      '    <div class="srch">',
-      '      <input type="search" placeholder="搜索表情包，如：哈哈 / 猫 / 无语" autocomplete="off" enterkeyhint="search">',
-      '      <button class="btn" data-act="search">搜索</button>',
-      '    </div>',
-      '    <div class="row">',
-      '      <select data-act="source"></select>',
-      '      <button class="btn gray sm" data-act="next">换一批</button>',
-      '      <button class="btn gray sm" data-act="url">发链接</button>',
-      '      <button class="btn gray sm" data-act="file">传本地</button>',
-      '    </div>',
-      '    <div class="status"></div>',
-      '    <div class="bar hidden"><i></i></div>',
-      '    <div class="grid"><div class="empty">输入关键词开始搜索表情包</div></div>',
-      '    <div class="ft">',
-      '      <div class="info">就绪</div>',
-      '      <button class="btn sm" data-act="send" disabled>发送</button>',
-      '    </div>',
-      '  </div>',
-      '  <div class="sheet hidden">',
-      '    <div class="sh"><div class="t">设置</div><button class="ib" data-act="close-settings">✕</button></div>',
-      '    <div class="sc">',
-      '      <div class="f"><label>服务端地址</label><input type="text" data-k="baseUrl"></div>',
-      '      <div class="f"><label>图片代理前缀（无 GM 通道时用于绕过跨域）</label>',
-      '        <input type="text" data-k="imageProxy" placeholder="https://wsrv.nl/?url=">',
-      '        <div class="hint">留空表示直连。代理会把图片转成可跨域读取的响应。</div></div>',
-      '      <div class="f"><label>压缩</label>',
-      '        <div class="sw"><span>自动压缩超限图片</span><input type="checkbox" data-k="autoCompress"></div>',
-      '        <div class="sw"><span>超过此大小(MB)开始压缩</span><input type="number" data-k="compressOverMB" min="1" max="20" step="0.5" style="width:84px"></div>',
-      '        <div class="sw"><span>最长边(px)</span><input type="number" data-k="maxDimension" min="320" max="4096" step="80" style="width:84px"></div>',
-      '      </div>',
-      '      <div class="f"><label>GIF → WebP</label>',
-      '        <div class="sw"><span>转换模式</span>',
-      '          <select data-k="gifToWebp">',
-      '            <option value="anim">动图 WebP（保留动画）</option>',
-      '            <option value="static">静态 WebP（只留首帧）</option>',
-      '            <option value="off">关闭，原样发送 GIF</option>',
-      '          </select></div>',
-      '        <div class="sw"><span>最长边(px)</span><input type="number" data-k="webpMaxDim" min="160" max="2048" step="80" style="width:84px"></div>',
-      '        <div class="sw"><span>质量 (0.5–1)</span><input type="number" data-k="webpQuality" min="0.5" max="1" step="0.05" style="width:84px"></div>',
-      '        <div class="hint">动图 WebP 依赖内核的 ImageDecoder 逐帧解码（Chrome / 安卓 WebView 94+），逐帧重新编码后自封装成动图容器。内核不支持时会自动降级为静态首帧并明确提示，不会闷声丢动画。',
-      '          质量默认 0.70：实测 q=0.9 时产出反而是原 GIF 的 1.5~2 倍（GIF 每帧只存变化区域，WebP 每帧是整幅有损编码），q≈0.7 才稳定压到 0.5~0.85 倍。转换后若没比原图小会自动降质重试，最终还是不小就直接发原 GIF。</div>',
-      '      </div>',
-      '      <div class="f"><label>交互</label>',
-      '        <div class="sw"><span>点击表情直接发送（不弹确认）</span><input type="checkbox" data-k="skipConfirm"></div>',
-      '      </div>',
-      '      <div class="f"><label>表情源（JSON 数组，可增删）</label>',
-      '        <textarea data-k="sources"></textarea>',
-      '        <div class="hint">html 源：url 支持 {kw} {page}，pattern 为正则字符串，exclude 为可选的排除正则；json 源：额外用 path（如 data.list[].url）取图。</div>',
-      '        <div style="display:flex;gap:6px;margin-top:8px">',
-      '          <button class="btn gray sm" data-act="reset-sources">恢复内置源</button>',
-      '          <button class="btn gray sm" data-act="test-src">测试当前源</button>',
-      '        </div>',
-      '      </div>',
-      '      <div class="f"><label>调试</label>',
-      '        <div class="sw"><span>输出调试日志到控制台</span><input type="checkbox" data-k="showLog"></div>',
-      '        <div class="logbox" data-k="log"></div>',
-      '        <div style="display:flex;gap:6px;margin-top:8px">',
-      '          <button class="btn gray sm" data-act="copy-log">复制日志</button>',
-      '          <button class="btn gray sm" data-act="clear-log">清空</button>',
-      '        </div>',
-      '      </div>',
-      '      <div class="f">',
-      '        <button class="btn" style="width:100%" data-act="save">保存设置</button>',
-      '      </div>',
-      '      <div class="hint">上传链路：POST /api/upload/presign → PUT OSS → POST /api/upload/bind → WS message(type=image)。与官方客户端一致。</div>',
-      '    </div>',
-      '  </div>',
-      '  <div class="rz"></div>',
-      '</div>',
-      '<div class="toast"></div>'
-    ].join('\n');
-
-    ui.host = host;
-    ui.shadow = shadow;
-    ui.root = wrap;
-    ui.els.fab = wrap.querySelector('.fab');
-    ui.els.panel = wrap.querySelector('.panel');
-    ui.els.grid = wrap.querySelector('.grid');
-    ui.els.input = wrap.querySelector('.srch input');
-    ui.els.status = wrap.querySelector('.status');
-    ui.els.bar = wrap.querySelector('.bar');
-    ui.els.info = wrap.querySelector('.ft .info');
-    ui.els.send = wrap.querySelector('[data-act="send"]');
-    ui.els.sheet = wrap.querySelector('.sheet');
-    ui.els.toast = wrap.querySelector('.toast');
-    ui.els.logBox = wrap.querySelector('.logbox');
-    ui.els.sourceSel = wrap.querySelector('[data-act="source"]');
-
-    bindUI();
-    applySavedGeometry();
-    renderSources();
-    syncSettingsForm();
+  function setSendEnabled(on) {
+    if (ui.els.send) ui.els.send.disabled = !on;
   }
 
-  /* ---------- 几何 / 拖拽 ---------- */
-
-  function geomKey() { return 'geom'; }
-
-  function defaultGeom() {
-    var mob = isMobile();
-    return {
-      fab: { x: window.innerWidth - 58, y: Math.round(window.innerHeight * 0.42) },
-      panel: {
-        x: Math.max(8, window.innerWidth - (mob ? 360 : 420) - 12),
-        y: Math.max(8, Math.round(window.innerHeight * 0.14)),
-        w: mob ? Math.min(window.innerWidth - 16, 360) : 420,
-        h: mob ? Math.min(window.innerHeight * 0.62, 560) : 560
-      }
-    };
+  function setFootVisible(on) {
+    if (ui.els.foot) ui.els.foot.classList[on ? 'remove' : 'add']('off');
   }
 
-  var geom = store.get(geomKey(), null) || defaultGeom();
-
-  function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
-
-  function applySavedGeometry() {
-    var g = geom;
-    g.fab.x = clamp(g.fab.x, 4, window.innerWidth - 50);
-    g.fab.y = clamp(g.fab.y, 40, window.innerHeight - 50);
-    ui.els.fab.style.left = g.fab.x + 'px';
-    ui.els.fab.style.top = g.fab.y + 'px';
-
-    var p = g.panel;
-    p.w = clamp(p.w, 260, Math.max(260, window.innerWidth - 16));
-    p.h = clamp(p.h, 260, Math.max(260, window.innerHeight - 16));
-    p.x = clamp(p.x, 4, Math.max(4, window.innerWidth - p.w - 4));
-    p.y = clamp(p.y, 4, Math.max(4, window.innerHeight - 60));
-    setPanelRect();
-    store.set(geomKey(), geom);
-  }
-
-  function setPanelRect() {
-    var p = geom.panel;
-    var el = ui.els.panel;
-    el.style.left = p.x + 'px';
-    el.style.top = p.y + 'px';
-    el.style.width = p.w + 'px';
-    el.style.height = p.h + 'px';
-  }
-
-  /**
-   * 统一手势：鼠标 / 触摸 / 触控笔通用。
-   *
-   * ⚠️ 移动端最关键的一条：touchstart 里 **绝对不能** 调 preventDefault()。
-   * 按 Touch Events 规范，一旦取消 touchstart，浏览器就不会再为这次轻点
-   * 派发兼容鼠标事件 —— 包括 click。桌面端因为 mouse 事件不受这个规则限制，
-   * 所以「电脑端正常、手机端点了没反应」正是这个坑的典型表现。
-   *
-   * 因此这里改成：只有在「确认已经进入拖拽」之后才阻止默认行为，
-   * 轻点由 touchend 自行判定（onTap），并给拖拽结束后紧跟的那次 click
-   * 加一个抑制窗口，避免一次操作被当成两次。
-   */
-  function dragify(handle, onMove, opts) {
-    opts = opts || {};
-    var SLOP = opts.slop || 8;          // 手指抖动容差(px)，超过才算拖拽
-    var TAP_MS = opts.tapMs || 600;     // 超过这个时长不算轻点
-    var st = null;                      // 当前手势状态
-    var suppressUntil = 0;              // 抑制 click 的截止时间戳
-
-    // 点在按钮/输入框上时不启动拖拽，否则移动端连标题栏的图标都点不动
-    function isInteractive(el) {
-      if (!opts.ignoreInteractive) return false;
-      while (el && el !== handle) {
-        var tag = el.tagName;
-        if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT' ||
-          tag === 'TEXTAREA' || tag === 'A' || tag === 'LABEL') return true;
-        el = el.parentNode;
-      }
-      return false;
-    }
-
-    function down(ev) {
-      if (ev.type === 'touchstart' && ev.touches && ev.touches.length > 1) return;
-      if (isInteractive(ev.target)) return;
-      var p = point(ev);
-      if (!p) return;
-      st = {
-        x: p.x, y: p.y, ox: p.x, oy: p.y,
-        t: Date.now(), moved: false, touch: ev.type !== 'mousedown'
-      };
-      // 这里故意不调 preventDefault()，见函数头注释
-    }
-
-    function move(ev) {
-      if (!st) return;
-      if (ev.type === 'touchmove' && ev.touches && ev.touches.length > 1) { st = null; return; }
-      var p = point(ev);
-      if (!p) return;
-      if (!st.moved) {
-        if (Math.abs(p.x - st.ox) + Math.abs(p.y - st.oy) < SLOP) return;
-        st.moved = true;                // 超过容差，认定为拖拽
-      }
-      onMove(p.x - st.x, p.y - st.y);
-      st.x = p.x;
-      st.y = p.y;
-      // 只在确认拖拽后阻止滚动，不影响轻点派发 click
-      if (ev.cancelable) ev.preventDefault();
-    }
-
-    function up(ev) {
-      if (!st) return;
-      var s = st;
-      st = null;
-      var dt = Date.now() - s.t;
-      var p = point(ev);
-      var dist = p ? (Math.abs(p.x - s.ox) + Math.abs(p.y - s.oy)) : 0;
-
-      if (s.moved) {
-        suppressUntil = Date.now() + 500;
-        if (opts.onDragEnd) opts.onDragEnd();
-        return;
-      }
-      if (dt <= TAP_MS && dist < SLOP) {
-        suppressUntil = Date.now() + 500;
-        if (opts.onTap) opts.onTap(ev);
-      }
-    }
-
-    function cancel() { st = null; }
-
-    handle.addEventListener('mousedown', down);
-    // touchstart 用 passive:true（反正不阻止默认行为），
-    // touchmove 必须 passive:false 才能在确认拖拽后 preventDefault
-    handle.addEventListener('touchstart', down, { passive: true });
-    window.addEventListener('mousemove', move);
-    window.addEventListener('touchmove', move, { passive: false });
-    window.addEventListener('mouseup', up);
-    window.addEventListener('touchend', up);
-    window.addEventListener('touchcancel', cancel);
-
-    return {
-      // 供原生 click 判断：拖拽/轻点刚结束时那次合成 click 应当忽略
-      suppressClick: function () { return Date.now() < suppressUntil; }
-    };
-  }
-
-  function point(ev) {
-    if (ev.touches && ev.touches.length) return { x: ev.touches[0].clientX, y: ev.touches[0].clientY };
-    if (ev.changedTouches && ev.changedTouches.length) return { x: ev.changedTouches[0].clientX, y: ev.changedTouches[0].clientY };
-    if (typeof ev.clientX === 'number') return { x: ev.clientX, y: ev.clientY };
-    return null;
-  }
-
-  /* ---------- 交互绑定 ---------- */
-
-  function bindUI() {
-    var w = ui.root;
-
-    // FAB：拖拽移动 + 轻点打开
-    var fabG = dragify(ui.els.fab, function (dx, dy) {
-      var g = geom.fab;
-      g.x = clamp(g.x + dx, 4, window.innerWidth - 50);
-      g.y = clamp(g.y + dy, 40, window.innerHeight - 50);
-      ui.els.fab.style.left = g.x + 'px';
-      ui.els.fab.style.top = g.y + 'px';
-    }, {
-      onTap: function () { openPanel(); },
-      onDragEnd: function () { store.set(geomKey(), geom); }
-    });
-
-    // 原生 click 兜底：桌面鼠标、以及移动端外接键盘/部分内核
-    // （移动端的轻点已在 onTap 处理，靠 suppressClick 去重，不会开两次）
-    ui.els.fab.addEventListener('click', function (ev) {
-      if (fabG.suppressClick()) { ev.preventDefault(); ev.stopPropagation(); return; }
-      openPanel();
-    });
-
-    // 标题栏拖拽（按钮区域跳过，否则移动端点不动 ⚙ / — 这些图标）
-    dragify(w.querySelector('.hd'), function (dx, dy) {
-      var p = geom.panel;
-      p.x = clamp(p.x + dx, 4, Math.max(4, window.innerWidth - p.w - 4));
-      p.y = clamp(p.y + dy, 0, Math.max(0, window.innerHeight - 48));
-      setPanelRect();
-    }, {
-      ignoreInteractive: true,
-      onDragEnd: function () { store.set(geomKey(), geom); }
-    });
-
-    // 缩放手柄（底部大面板下已被 CSS 隐藏）
-    dragify(w.querySelector('.rz'), function (dx, dy) {
-      var p = geom.panel;
-      p.w = clamp(p.w + dx, 260, Math.max(260, window.innerWidth - p.x - 4));
-      p.h = clamp(p.h + dy, 260, Math.max(260, window.innerHeight - p.y - 4));
-      setPanelRect();
-    }, {
-      onDragEnd: function () { store.set(geomKey(), geom); }
-    });
-
-    // 事件委托
-    w.addEventListener('click', function (ev) {
-      var t = ev.target;
-      var act = t && t.getAttribute ? t.getAttribute('data-act') : null;
-      if (!act) return;
-      switch (act) {
-        case 'search': doSearch(1); break;
-        case 'next': doSearch((state.page || 1) + 1); break;
-        case 'settings': openSettings(); break;
-        case 'close-settings': closeSettings(); break;
-        case 'min': closePanel(); break;
-        case 'send': sendSelected(); break;
-        case 'url': sendFromUrl(); break;
-        case 'file': sendFromFile(); break;
-        case 'save': commitSettings(); break;
-        case 'reset-sources': resetSources(); break;
-        case 'test-src': testSource(); break;
-        case 'copy-log': copyLog(); break;
-        case 'clear-log': logBuf.length = 0; if (ui.els.logBox) ui.els.logBox.textContent = ''; break;
-        case 'theme': toggleTheme(); break;
-        case 'wide': ui.els.grid.classList.toggle('wide'); break;
-        default: break;
-      }
-    });
-
-    ui.els.input.addEventListener('keydown', function (ev) {
-      if (ev.key === 'Enter') { ev.preventDefault(); doSearch(1); }
-    });
-  }
-
-  function toggleTheme() {
-    var dark = ui.root.classList.toggle('dark');
-    settings.theme = dark ? 'dark' : 'light';
-    saveSettings();
-  }
-
-  function openPanel() {
-    if (!ui.els.panel) return;
-    ui.els.panel.classList.remove('hidden');
-    ui.els.fab.classList.add('hidden');
-    if (isMobile()) ui.els.panel.classList.add('full');
-    ui.isOpen = true;
-    if (ui.els.logBox) ui.els.logBox.textContent = logBuf.slice(-80).join('\n');
-    log('面板已打开', { mobile: isMobile(), full: ui.els.panel.classList.contains('full') });
-    // 移动端不自动聚焦：一点开就弹软键盘会顶飞布局，也让用户来不及看清结果
-    if (!isMobile()) {
-      setTimeout(function () { try { ui.els.input.focus(); } catch (e) { /* ignore */ } }, 60);
-    }
-  }
-
-  function closePanel() {
-    ui.els.panel.classList.add('hidden');
-    ui.els.panel.classList.remove('full');
-    ui.els.fab.classList.remove('hidden');
-    ui.isOpen = false;
-  }
+  /* ---------- 设置面板开关 ---------- */
 
   function openSettings() {
     syncSettingsForm();
-    ui.els.sheet.classList.remove('hidden');
+    if (ui.els.logBox) ui.els.logBox.textContent = logBuf.slice(-80).join('\n');
+    if (ui.els.sheet) ui.els.sheet.classList.remove('off');
   }
-  function closeSettings() { ui.els.sheet.classList.add('hidden'); }
+
+  function closeSettings() {
+    if (ui.els.sheet) ui.els.sheet.classList.add('off');
+  }
 
   /* ---------- 渲染 ---------- */
 
+  function gridEmpty(text) {
+    var grid = ui.els.grid;
+    if (!grid) return;
+    grid.innerHTML = '';
+    var d = document.createElement('div');
+    d.className = 'empty';
+    d.innerHTML = esc(text).replace(/\n/g, '<br>');
+    grid.appendChild(d);
+  }
+
   function renderSources() {
     var sel = ui.els.sourceSel;
+    if (!sel) return;
     var list = activeSources();
     sel.innerHTML = '';
     for (var i = 0; i < list.length; i++) {
@@ -1919,67 +2153,79 @@
       state.sourceId = list[0] ? list[0].id : null;
     }
     if (state.sourceId) sel.value = state.sourceId;
-    sel.onchange = function () { state.sourceId = sel.value; };
   }
 
   function renderResults(list) {
     var grid = ui.els.grid;
+    if (!grid) return;
     grid.innerHTML = '';
     if (!list.length) {
-      var d = document.createElement('div');
-      d.className = 'empty';
-      d.textContent = '没有结果，换个关键词或换一个表情源试试';
-      grid.appendChild(d);
+      gridEmpty('没有结果，换个关键词或换一个表情源试试');
       return;
     }
     var frag = document.createDocumentFragment();
     for (var i = 0; i < list.length; i++) {
-      (function (url, idx) {
-        var cell = document.createElement('div');
-        cell.className = 'cell';
-        cell.setAttribute('data-url', url);
-        cell.setAttribute('title', url);
+      var url = list[i];
+      var cell = document.createElement('div');
+      cell.className = 'cell';
+      cell.setAttribute('data-url', url);
+      cell.setAttribute('title', url);
 
-        var img = document.createElement('img');
-        img.loading = 'lazy';
-        img.decoding = 'async';
-        img.referrerPolicy = 'no-referrer';
-        img.src = url;
+      var img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.referrerPolicy = 'no-referrer';
+      img.src = url;
+      (function (c) {
         img.onerror = function () {
           var b = document.createElement('div');
-          b.className = 'badge';
+          b.className = 'm2';
           b.textContent = '加载失败';
-          cell.appendChild(b);
+          c.appendChild(b);
         };
-        cell.appendChild(img);
+      })(cell);
+      cell.appendChild(img);
 
-        if (/\.gif(\?|$)/i.test(url)) {
-          var g = document.createElement('div');
-          g.className = 'badge';
-          g.textContent = 'GIF';
-          cell.appendChild(g);
-        }
-
-        cell.addEventListener('click', function () {
-          var prev = grid.querySelector('.cell.sel');
-          if (prev) prev.classList.remove('sel');
-          if (state.selected === url) {
-            state.selected = null;
-            ui.els.send.disabled = true;
-          } else {
-            state.selected = url;
-            cell.classList.add('sel');
-            ui.els.send.disabled = false;
-            if (settings.skipConfirm) { sendSelected(); return; }
-          }
-          ui.els.info.textContent = state.selected
-            ? ('已选择第 ' + (idx + 1) + ' 张 · ' + shortUrl(state.selected))
-            : '就绪';
-        });
-        frag.appendChild(cell);
-      })(list[i], i);
+      if (/\.gif(\?|$)/i.test(url)) {
+        var g = document.createElement('div');
+        g.className = 'tg';
+        g.textContent = 'GIF';
+        cell.appendChild(g);
+      }
+      frag.appendChild(cell);
     }
     grid.appendChild(frag);
+    // 每次结果变化都重置选中态：旧的选中项已经不在 DOM 里了
+    state.selected = null;
+    setSendEnabled(false);
+  }
+
+  /** 点一下格子：默认直接发；关闭 tapSend 时改为选中后再点「发送」 */
+  function pickCell(cell) {
+    var url = cell && cell.getAttribute ? cell.getAttribute('data-url') : null;
+    if (!url) return;
+    if (state.busy) { toast('正在处理上一张，请稍候'); return; }
+
+    if (settings.tapSend) {
+      sendOne({ type: 'url', url: url, cell: cell });
+      return;
+    }
+
+    var grid = ui.els.grid;
+    var prev = grid && grid.querySelector ? grid.querySelector('.cell.on') : null;
+    if (prev && prev !== cell) prev.classList.remove('on');
+
+    if (state.selected === url) {
+      state.selected = null;
+      cell.classList.remove('on');
+      setSendEnabled(false);
+      setStatus('已取消选择');
+      return;
+    }
+    state.selected = url;
+    cell.classList.add('on');
+    setSendEnabled(true);
+    setStatus('已选中 ' + shortUrl(url) + '，点「发送」发出');
   }
 
   function shortUrl(u) {
@@ -1992,7 +2238,8 @@
   /* ---------- 搜索 ---------- */
 
   function doSearch(page) {
-    var kw = String(ui.els.input.value || '').trim();
+    var inp = ui.els.input;
+    var kw = inp ? String(inp.value || '').trim() : '';
     if (!kw) { toast('请输入关键词'); return; }
     var list = activeSources();
     if (!list.length) { toast('没有可用的表情源，请到设置里配置', 'error'); return; }
@@ -2009,8 +2256,8 @@
     state.query = kw;
     state.page = page || 1;
     state.selected = null;
-    ui.els.send.disabled = true;
-    ui.els.grid.innerHTML = '<div class="empty">搜索中…</div>';
+    setSendEnabled(false);
+    gridEmpty('搜索中…');
     setStatus('正在从「' + (primary.name || primary.id) + '」搜索：' + kw + '（第 ' + state.page + ' 页）');
 
     var tried = [];
@@ -2048,16 +2295,16 @@
       renderResults(r.urls);
       var name = r.src.name || r.src.id;
       if (r.urls.length) {
-        setStatus('「' + name + '」第 ' + state.page + ' 页 · ' + r.urls.length + ' 张（点击选择）');
+        setStatus('「' + name + '」第 ' + state.page + ' 页 · ' + r.urls.length + ' 张' +
+          (settings.tapSend ? '（点一下直接发送）' : '（先选中再点发送）'));
         if (tried.length) toast('已自动切换到「' + name + '」', 'warn');
       } else {
         setStatus('没有搜索结果');
-        ui.els.grid.innerHTML = '<div class="empty">没有搜索结果，换个关键词或换个源试试</div>';
+        gridEmpty('没有搜索结果，换个关键词或换个源试试');
       }
-      ui.els.info.textContent = '就绪';
     }).catch(function (e) {
       state.results = [];
-      ui.els.grid.innerHTML = '<div class="empty">搜索失败：' + esc(e.message) + '</div>';
+      gridEmpty('搜索失败：' + e.message);
       setStatus('搜索失败：' + e.message);
       toast('所有表情源都失败了', 'error');
     }).then(function () {
@@ -2068,7 +2315,8 @@
   function testSource() {
     var src = getSource(state.sourceId);
     if (!src) { toast('没有可用表情源', 'error'); return; }
-    var kw = String(ui.els.input.value || '').trim() || '哈哈';
+    var inp = ui.els.input;
+    var kw = (inp ? String(inp.value || '').trim() : '') || '哈哈';
     setStatus('测试「' + src.name + '」…');
     searchSource(src, kw, 1).then(function (urls) {
       toast('可用，返回 ' + urls.length + ' 张', 'ok');
@@ -2082,7 +2330,7 @@
   /* ---------- 发送主流程 ---------- */
 
   function sendSelected() {
-    if (!state.selected) { toast('先选一张表情'); return; }
+    if (!state.selected) { toast('先点一张梗图选中它'); return; }
     var url = state.selected;
     sendOne({ type: 'url', url: url });
   }
@@ -2117,9 +2365,28 @@
     if (state.busy) { toast('正在处理上一张，请稍候'); return; }
 
     state.busy = true;
-    ui.els.send.disabled = true;
+    setSendEnabled(false);
     setProgress(0);
     setStatus('准备中…');
+    // 点哪张就把「处理中」标在哪张上，面板很矮，全靠状态反馈
+    if (src.cell) {
+      src.cell.classList.add('busy');
+      if (src.cell.querySelector && !src.cell.querySelector('.m2')) {
+        var tip = document.createElement('div');
+        tip.className = 'm2';
+        tip.textContent = '处理中…';
+        src.cell.appendChild(tip);
+      }
+    }
+    function clearCell(state2) {
+      if (!src.cell) return;
+      src.cell.classList.remove('busy');
+      var tip = src.cell.querySelector ? src.cell.querySelector('.m2') : null;
+      if (tip) {
+        if (!state2) { tip.remove(); return; }
+        tip.textContent = state2;
+      }
+    }
 
     Promise.resolve()
       .then(function () {
@@ -2232,12 +2499,11 @@
         if (r.acked) {
           toast('已发送 ✓', 'ok');
           setStatus('已发送：' + shortUrl(r.bound.url));
-          ui.els.info.textContent = '已发送 · ' + shortUrl(r.bound.url);
         } else {
           toast('已提交，但未收到回执，请确认是否送达', 'warn');
-          setStatus('已提交（未收到回执）');
-          ui.els.info.textContent = '未收到回执 · ' + shortUrl(r.bound.url);
+          setStatus('已提交（未收到回执）：' + shortUrl(r.bound.url));
         }
+        clearCell('');
         setTimeout(function () { setProgress(null); }, 700);
       })
       .catch(function (e) {
@@ -2245,19 +2511,20 @@
         var msg = (e && e.message) || '发送失败';
         toast(msg, 'error');
         setStatus('失败：' + msg);
-        ui.els.info.textContent = '失败';
+        clearCell('失败');
         log('发送失败', e);
       })
       .then(function () {
         state.busy = false;
-        ui.els.send.disabled = !state.selected;
+        setSendEnabled(!!state.selected || !!settings.tapSend);
       });
   }
 
   /* ---------- 设置表单 ---------- */
 
   function syncSettingsForm() {
-    var w = ui.root;
+    var w = ui.ovRoot;
+    if (!w) return;
     var inputs = w.querySelectorAll('[data-k]');
     for (var i = 0; i < inputs.length; i++) {
       var el = inputs[i];
@@ -2270,7 +2537,8 @@
   }
 
   function commitSettings() {
-    var w = ui.root;
+    var w = ui.ovRoot;
+    if (!w) return;
     var inputs = w.querySelectorAll('[data-k]');
     var next = clone(settings);
     for (var i = 0; i < inputs.length; i++) {
@@ -2299,8 +2567,9 @@
     settings = mergeSettings(next);
     saveSettings();
     renderSources();
-    if (settings.theme === 'dark') ui.root.classList.add('dark');
-    else if (settings.theme === 'light') ui.root.classList.remove('dark');
+    applyPaneVars();                       // 缩略图尺寸可能被改了，立刻生效
+    setFootVisible(!settings.tapSend);
+    if (!settings.tapSend) setSendEnabled(false);
     closeSettings();
     toast('设置已保存', 'ok');
     log('设置已保存');
@@ -2342,20 +2611,18 @@
 
   function boot() {
     buildUI();
-    // 站点自身的 DOM 变化不影响我们（shadow DOM 隔离），仅处理窗口尺寸变化
-    window.addEventListener('resize', function () {
-      applySavedGeometry();
-    });
+    setFootVisible(!settings.tapSend);
     if (typeof GM_registerMenuCommand === 'function') {
       try {
-        GM_registerMenuCommand('打开表情包面板', openPanel);
-        GM_registerMenuCommand('切换主题', toggleTheme);
+        GM_registerMenuCommand('打开梗图面板', openMemeTab);
+        GM_registerMenuCommand('梗图助手设置', openSettings);
       } catch (e) { /* ignore */ }
     }
-    log('表情包助手已加载 v' + VERSION, {
+    log('梗图助手已加载 v' + VERSION, {
       mobile: isMobile(),
       gm: (typeof GM_xmlhttpRequest === 'function'),
-      sources: activeSources().length
+      sources: activeSources().length,
+      injected: !!ui.tab
     });
   }
 

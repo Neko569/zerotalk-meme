@@ -41,14 +41,59 @@
   }
   @media (prefers-color-scheme: dark) { button { background: #26282d; border-color: #3a3d44; color: #e9eaee; } }
   .chatmock {
-    border: 1px dashed #c9ced6; border-radius: 12px; height: 260px; position: relative;
+    border: 1px dashed #c9ced6; border-radius: 12px; padding: 10px;
     background: repeating-linear-gradient(45deg, #fafbfc, #fafbfc 10px, #f3f5f8 10px, #f3f5f8 20px);
-    overflow: hidden;
   }
   @media (prefers-color-scheme: dark) {
     .chatmock { border-color: #3a3d44; background: repeating-linear-gradient(45deg, #1a1b20, #1a1b20 10px, #202227 10px, #202227 20px); }
   }
-  .chatmock .hintbox { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #9aa0a6; font-size: 12px; }
+
+  /* —— 桩：聊天输入区 + 表情面板 ——
+     类名与真实站点一致，并复刻了站点那几条「决定布局」的规则
+     （轨道 200% + translate3d 滑栏、flex-basis:0 的 Tab 等宽）。
+     脚本注入的第三个 Tab / 第三栏就是靠这些规则融进去的。 */
+  .chat-input-dock { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+  .composer-tool {
+    width: 34px; height: 34px; border-radius: 10px; border: 1px solid #d9dce1;
+    background: #fff; font-size: 17px; line-height: 1; cursor: pointer;
+  }
+  .composer-emoji-panel {
+    width: 340px; height: 320px; padding: 8px; background: #fff;
+    border: 1px solid #e5e7eb; border-radius: 14px; box-shadow: 0 8px 24px #0f172a1f;
+    display: none; flex-direction: column; overflow: hidden;
+  }
+  .composer-emoji-panel--open { display: flex; }
+  .composer-emoji-panel__slide, .composer-emoji-panel__body {
+    display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0;
+  }
+  .emoji-mode-tabs {
+    position: relative; display: flex; gap: 0; margin: 0 .15rem .5rem;
+    padding: .18rem; flex: 0 0 auto; border-radius: 999px; background: #f1f5f9;
+  }
+  .emoji-mode-tabs__indicator {
+    position: absolute; top: .18rem; bottom: .18rem; left: .18rem;
+    width: calc(50% - .18rem); border-radius: 999px; background: #0f172a;
+    box-shadow: 0 1px 3px #0f172a2e; transform: translateZ(0);
+    transition: transform .28s cubic-bezier(.22,1,.36,1); pointer-events: none; z-index: 0;
+  }
+  .emoji-mode-tabs[data-mode=sticker] .emoji-mode-tabs__indicator { transform: translate3d(100%,0,0); }
+  .emoji-mode-tabs__btn {
+    position: relative; z-index: 1; flex: 1 1 0; height: 1.75rem; border: none;
+    border-radius: 999px; background: transparent; color: #64748b; font-size: .8rem;
+    font-weight: 600; cursor: pointer; transition: color .2s ease; -webkit-tap-highlight-color: transparent;
+  }
+  .emoji-mode-tabs__btn--active { color: #fff; }
+  .emoji-swap { flex: 1 1 auto; min-height: 0; overflow: hidden; contain: layout paint; }
+  .emoji-swap__track {
+    display: flex; width: 200%; height: 100%; transform: translateZ(0);
+    transition: transform .3s cubic-bezier(.22,1,.36,1); backface-visibility: hidden;
+  }
+  .emoji-swap[data-mode=sticker] .emoji-swap__track { transform: translate3d(-50%,0,0); }
+  .emoji-swap__pane {
+    width: 50%; height: 100%; flex: 0 0 50%; min-width: 0; min-height: 0;
+    display: flex; flex-direction: column;
+  }
+  .zx-ph { padding: 10px; color: #94a3b8; font-size: 12px; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
   #zx-log { max-height: 340px; }
 </style>
@@ -61,7 +106,7 @@
   <div class="card">
     <h2>怎么用 <span class="pill">3 步</span></h2>
     <ol>
-      <li>点右下角 😊 悬浮球打开面板。</li>
+      <li>点下面模拟聊天区的 😊 按钮展开表情面板，切到第三个 <b>梗图</b> 栏。</li>
       <li>输入任意关键词（如 <b>哈哈</b>）→ 搜索 → 点一张图选中 → 发送。</li>
       <li>滚到本页下方看 <b>请求日志</b>，逐条对照 <code>PROTOCOL.md</code> 里的抓包格式。</li>
     </ol>
@@ -73,8 +118,34 @@
   </div>
 
   <div class="card">
-    <h2>模拟聊天页</h2>
-    <div class="chatmock"><div class="hintbox">（这里在真实站点上是聊天界面，本页只放一个占位）</div></div>
+    <h2>模拟聊天页 <span class="pill">结构对齐真实站点</span></h2>
+    <div class="chatmock">
+      <div class="chat-input-dock">
+        <div class="composer-emoji-panel composer-emoji-panel--open">
+          <div class="composer-emoji-panel__slide">
+            <div class="composer-emoji-panel__body">
+              <div class="emoji-mode-tabs" role="tablist" data-mode="emoji">
+                <span class="emoji-mode-tabs__indicator" aria-hidden="true"></span>
+                <button class="emoji-mode-tabs__btn emoji-mode-tabs__btn--active" type="button" role="tab" aria-selected="true">Emoji</button>
+                <button class="emoji-mode-tabs__btn" type="button" role="tab" aria-selected="false">表情包</button>
+              </div>
+              <div class="emoji-swap" data-mode="emoji">
+                <div class="emoji-swap__track">
+                  <div class="emoji-swap__pane" role="tabpanel">
+                    <div class="emoji-ui"><div class="emoji-scroll zx-ph">（桩：原生 Emoji 栏）</div></div>
+                  </div>
+                  <div class="emoji-swap__pane" role="tabpanel" inert>
+                    <div class="sticker-ui"><div class="emoji-scroll zx-ph">（桩：原生表情包栏）</div></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <button class="composer-tool" type="button" aria-label="表情">😊</button>
+      </div>
+    </div>
+    <div class="row"><span class="sub" style="margin:0">点 <b>😊</b> 收起/展开面板；点第三个 <b>梗图</b> 栏试试搜索。</span></div>
   </div>
 
   <div class="card">
@@ -317,11 +388,37 @@ document.getElementById('btn-copy').onclick = function () {
   else alert('当前环境不支持剪贴板，请手动选中复制');
 };
 document.getElementById('btn-open').onclick = function () {
-  var host = document.getElementById('ztm-host');
-  if (!host || !host.shadowRoot) { alert('脚本还没加载完成，稍等一下或刷新页面'); return; }
-  var fab = host.shadowRoot.querySelector('.fab');
-  if (fab) fab.click();
+  var panel = document.querySelector('.composer-emoji-panel');
+  if (!panel) { alert('页面里没找到表情面板'); return; }
+  panel.classList.add('composer-emoji-panel--open');
+  var tab = panel.querySelector('.ztm-tab');
+  if (!tab) { alert('脚本还没注入完成，稍等一下或刷新页面'); return; }
+  tab.click();                       // 等价于脚本 GM 菜单里的「打开梗图面板」
 };
+
+/* 4.1) 桩：模拟站点自己那两个原生 Tab 的行为（真实站点上这一步是 Vue 做的）。
+       脚本注入的第三个 Tab 由脚本自己接管，这里要跳过。 */
+(function () {
+  var tabs = document.querySelector('.emoji-mode-tabs');
+  var swap = document.querySelector('.emoji-swap');
+  if (!tabs || !swap) return;
+  tabs.addEventListener('click', function (ev) {
+    var b = ev.target && ev.target.closest ? ev.target.closest('.emoji-mode-tabs__btn') : null;
+    if (!b) return;
+    var btns = tabs.querySelectorAll('.emoji-mode-tabs__btn');
+    var idx = Array.prototype.indexOf.call(btns, b);
+    if (idx < 0 || idx > 1) return;                 // 第三个（梗图）不归站点管
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle('emoji-mode-tabs__btn--active', i === idx);
+    }
+    swap.setAttribute('data-mode', idx === 1 ? 'sticker' : 'emoji');
+    tabs.setAttribute('data-mode', idx === 1 ? 'sticker' : 'emoji');
+  });
+  var tool = document.querySelector('.composer-tool[aria-label="表情"]');
+  if (tool) tool.addEventListener('click', function () {
+    document.querySelector('.composer-emoji-panel').classList.toggle('composer-emoji-panel--open');
+  });
+})();
 
 /* 5) 缩略图：真实的 mock.meme 域名不存在，这里替换成可显示的占位图，便于看 UI */
 (function () {
@@ -335,9 +432,9 @@ document.getElementById('btn-open').onclick = function () {
   ];
   var i = 0;
   var obs = new MutationObserver(function () {
-    var host = document.getElementById('ztm-host');
-    if (!host || !host.shadowRoot) return;
-    host.shadowRoot.querySelectorAll('.grid img').forEach(function (img) {
+    var pane = document.querySelector('.emoji-swap__pane.ztm-pane');
+    if (!pane || !pane.shadowRoot) return;
+    pane.shadowRoot.querySelectorAll('.grid img').forEach(function (img) {
       if (img.src.indexOf('img.doutupk.com') === -1) return;
       if (img.getAttribute('data-zx')) return;
       img.setAttribute('data-zx', '1');
