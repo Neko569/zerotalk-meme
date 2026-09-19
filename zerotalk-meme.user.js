@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         零语表情包助手 · Zerotalk Meme Helper
 // @namespace    https://app.zerotalk.cn/
-// @version      1.0.1
-// @description  悬浮窗搜索网络表情包，一键以图片消息发送到零语聊天房间。完整复刻官方上传链路（presign → OSS PUT → bind → WebSocket message），支持手机端 Via 浏览器。
+// @version      1.1.1
+// @description  悬浮窗搜索网络表情包，一键以图片消息发送到零语聊天房间。完整复刻官方上传链路（presign → OSS PUT → bind → WebSocket message），支持手机端 Via 浏览器，支持 GIF 转 WebP。
 // @author       Neko
 // @match        *://app.zerotalk.cn/*
 // @match        *://*.zerotalk.cn/*
@@ -17,6 +17,9 @@
 // @connect      doutupk.com
 // @connect      img.doutupk.com
 // @connect      fabiaoqing.com
+// @connect      xiaoapi.cn
+// @connect      biaoqing.gtimg.com
+// @connect      tugelepic.mse.sogou.com
 // @connect      wsrv.nl
 // @connect      *
 // @run-at       document-start
@@ -31,7 +34,7 @@
    * 0. 常量 / 环境
    * =======================================================================*/
 
-  var VERSION = '1.0.1';
+  var VERSION = '1.1.1';
   var PREFIX = 'ztm';
 
   // 从抓包日志还原的服务端常量
@@ -128,6 +131,20 @@
       pattern: 'https?://www\\.fabiaoqing\\.com/uploads/[^"\\\'\\s<>]+?\\.(?:jpg|jpeg|png|gif|webp)',
       exclude: '/thumb/|/_thumb\\.',
       https: true
+    },
+    {
+      // 说明：这个接口的坑是关键词参数叫 msg 而不是 text/keyword ——
+      // 传 text 不会报错，只会静默返回默认的「慕名」文字图，很容易误判成「接口坏了」。
+      // 分页参数是 page（1 起），需与 msg 同时给出；num 控制每页数量（默认 40，实测 60 也认）。
+      // 图片来自腾讯表情 CDN（biaoqing.gtimg.com），实测 jpg/png/gif 混合，GIF 占比约 40%。
+      // 搜不到结果时不会返回空数组，而是回落到「关键词文字表情」图，属正常行为。
+      id: 'xiaoapi',
+      name: '慕名 API（备用）',
+      enabled: true,
+      kind: 'json',
+      url: 'https://xiaoapi.cn/v1/meme.php?msg={kw}&page={page}&num=40',
+      path: 'data[].img_url',
+      https: true
     }
   ];
 
@@ -142,6 +159,9 @@
       autoCompress: true,
       compressOverMB: 4,
       maxDimension: 1600,
+      gifToWebp: 'anim',
+      webpMaxDim: 480,
+      webpQuality: 0.7,
       imageProxy: 'https://wsrv.nl/?url=',
       preferHookSocket: true,
       allowStandaloneSocket: false,
@@ -446,6 +466,104 @@
     return 'application/octet-stream';
   }
 
+  /**
+   * 归一化 MIME。
+   *
+   * 最要命的一个是 image/jpg —— 这不是标准 MIME（标准是 image/jpeg），
+   * 但很多图床/CDN 就是这么返回的。零语服务端会直接回「不支持的文件类型」，
+   * 而抓包日志里只看到 content_type: image/jpg，很容易误以为是 WebP 的锅。
+   * 同类别名还有 image/pjpeg、image/x-png、image/x-webp 等。
+   */
+  function normalizeMime(m) {
+    m = String(m || '').split(';')[0].trim().toLowerCase();
+    if (!m) return '';
+    if (m === 'image/jpg' || m === 'image/pjpeg' || m === 'image/x-jpg' ||
+      m === 'image/jpe' || m === 'image/jfif') return 'image/jpeg';
+    if (m === 'image/x-png') return 'image/png';
+    if (m === 'image/x-webp') return 'image/webp';
+    if (m === 'image/x-gif') return 'image/gif';
+    return m;
+  }
+
+  /**
+   * 按文件头识别真实格式 —— 比 content-type 可靠得多。
+   * CDN 会撒谎：给 .jpg 的 URL 返回 PNG、动态接口返回的 URL 干脆没后缀、
+   * jpeg 被写成 image/jpg……服务端只认标准值，所以上传前以字节为准。
+   */
+  var FORMAT_TABLE = [
+    { mime: 'image/jpeg', ext: 'jpg', magic: [0xFF, 0xD8, 0xFF] },
+    { mime: 'image/png', ext: 'png', magic: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] },
+    { mime: 'image/gif', ext: 'gif', magic: [0x47, 0x49, 0x46, 0x38] },   // GIF87a / GIF89a
+    { mime: 'image/bmp', ext: 'bmp', magic: [0x42, 0x4D] }
+  ];
+
+  function sniffFormat(head) {
+    if (!head || head.length < 4) return null;
+    var i, j;
+    for (i = 0; i < FORMAT_TABLE.length; i++) {
+      var f = FORMAT_TABLE[i];
+      var hit = true;
+      for (j = 0; j < f.magic.length; j++) {
+        if (head[j] !== f.magic[j]) { hit = false; break; }
+      }
+      if (hit) return { mime: f.mime, ext: f.ext };
+    }
+    // WebP: RIFF....WEBP
+    if (head.length >= 12 &&
+      head[0] === 0x52 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x46 &&
+      head[8] === 0x57 && head[9] === 0x45 && head[10] === 0x42 && head[11] === 0x50) {
+      return { mime: 'image/webp', ext: 'webp' };
+    }
+    return null;
+  }
+
+  function sniffFormatBytes(buf) {
+    if (!buf) return null;
+    try {
+      var u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
+      return sniffFormat(u8.subarray(0, 16));
+    } catch (e) { return null; }
+  }
+
+  function readMagic(blob) {
+    return new Promise(function (resolve) {
+      try {
+        var head = blob.slice(0, 16);
+        if (head && head.arrayBuffer) {
+          head.arrayBuffer().then(function (ab) {
+            resolve(new Uint8Array(ab));
+          }, function () { resolve(null); });
+          return;
+        }
+      } catch (e) { /* 落到下面的兜底 */ }
+      resolve(null);
+    });
+  }
+
+  /**
+   * 决定这次上传用哪个 content_type / ext / 文件名。
+   * 优先信文件头；认不出来才回退到（归一化后的）content-type 与文件名后缀。
+   */
+  function resolveUploadFormat(blob, filename) {
+    var declaredRaw = String(blob.type || '');
+    var declared = normalizeMime(declaredRaw);
+    if (!declared || declared === 'application/octet-stream') declared = mimeFromName(filename);
+    declared = normalizeMime(declared);
+
+    return readMagic(blob).then(function (head) {
+      var s = sniffFormat(head);
+      var mime = (s && s.mime) || declared || 'image/jpeg';
+      var ext = (s && s.ext) || extFromMime(mime);
+      return {
+        mime: mime,
+        ext: ext,
+        name: alignName(filename, mime),
+        sniffed: !!s,
+        declared: declaredRaw
+      };
+    });
+  }
+
   function nameFromUrl(url) {
     try {
       var clean = String(url).split('#')[0].split('?')[0];
@@ -504,7 +622,7 @@
       if (onProgress) onProgress(0);
       return Promise.resolve().then(fn).then(function (res) {
         if (res && res.blob) {
-          var m0 = res.blob.type || mimeFromName(res.filename);
+          var m0 = normalizeMime(res.blob.type) || mimeFromName(res.filename);
           if (m0 === 'application/octet-stream') m0 = mimeFromName(res.filename);
           if (m0.indexOf('image/') !== 0) throw new Error('返回内容不是图片');
           return { blob: (res.blob.type === m0) ? res.blob : res.blob.slice(0, res.blob.size, m0), filename: alignName(res.filename, m0) };
@@ -512,7 +630,9 @@
         if (!res || !res.body || res.status < 200 || res.status >= 300) throw new Error('下载失败 HTTP ' + (res && res.status));
         var buf = res.body;
         if (!(buf instanceof ArrayBuffer) && !(buf instanceof Uint8Array)) throw new Error('响应体异常');
-        var mime = sniffMime(res.headers) || mimeFromName(fileName);
+        // 文件头优先于响应头：CDN 会返回 image/jpg 这种非标准值，甚至给 .jpg 的 URL 回 PNG
+        var sniffed = sniffFormatBytes(buf);
+        var mime = (sniffed && sniffed.mime) || normalizeMime(sniffMime(res.headers)) || mimeFromName(fileName);
         if (mime === 'application/octet-stream') mime = mimeFromName(fileName);
         var blob = new Blob([buf], { type: mime });
         if (!blob.size) throw new Error('图片为空');
@@ -667,6 +787,298 @@
   }
 
   /* =========================================================================
+   * 7.5 GIF → WebP
+   *
+   * 两种模式：
+   *   static —— 只取首帧，编码成静帧 WebP。到处都能跑，但会丢动画。
+   *   anim   —— 逐帧解码 + 每帧编码成静帧 WebP，再自己封装成动图 WebP。
+   *            依赖 WebCodecs 的 ImageDecoder（Chrome/Android WebView 94+），
+   *            不可用时自动降级为 static 并明确告知用户，不会闷声丢动画。
+   *
+   * 为什么自己封装：浏览器没有原生的「动图 WebP 编码器」。
+   * canvas.toBlob('image/webp') 只能出静帧，所以每帧先编码成独立静帧 WebP，
+   * 再把它们的 VP8/VP8L/ALPH 码流重新包进 ANMF 块，拼出 RIFF/WEBP 动图容器。
+   * =======================================================================*/
+
+  var WEBP_MIME = 'image/webp';
+  var MAX_ANIM_FRAMES = 120;          // 超过就放弃动图，避免手机上卡死/爆内存
+  var _canEncodeWebp = null;
+
+  function canEncodeWebp() {
+    if (_canEncodeWebp !== null) return _canEncodeWebp;
+    try {
+      var c = document.createElement('canvas');
+      c.width = 1; c.height = 1;
+      _canEncodeWebp = String(c.toDataURL(WEBP_MIME)).indexOf('data:image/webp') === 0;
+    } catch (e) {
+      _canEncodeWebp = false;
+    }
+    return _canEncodeWebp;
+  }
+
+  // ---- RIFF 小工具 ----
+
+  function rd32(b, o) { return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0; }
+  function wr32(b, o, v) { b[o] = v & 255; b[o + 1] = (v >>> 8) & 255; b[o + 2] = (v >>> 16) & 255; b[o + 3] = (v >>> 24) & 255; }
+  function wr16(b, o, v) { b[o] = v & 255; b[o + 1] = (v >>> 8) & 255; }
+  function wr24(b, o, v) { b[o] = v & 255; b[o + 1] = (v >>> 8) & 255; b[o + 2] = (v >>> 16) & 255; }
+  function id4(b, o) { return String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]); }
+  function wrId(b, o, s) { b[o] = s.charCodeAt(0); b[o + 1] = s.charCodeAt(1); b[o + 2] = s.charCodeAt(2); b[o + 3] = s.charCodeAt(3); return o + 4; }
+
+  /**
+   * 从一张静帧 WebP 里取出可以放进 ANMF 的码流块。
+   * 丢掉 VP8X（帧内不允许）、ICCP/EXIF/XMP（属于文件级元数据），保留 ALPH + VP8 /VP8L。
+   */
+  function parseStillWebp(u8) {
+    if (u8.length < 16 || id4(u8, 0) !== 'RIFF' || id4(u8, 8) !== 'WEBP') {
+      throw new Error('不是 WebP 静帧数据');
+    }
+    var chunks = [];
+    var hasAlpha = false;
+    var p = 12;
+    while (p + 8 <= u8.length) {
+      var id = id4(u8, p);
+      var size = rd32(u8, p + 4);
+      var start = p + 8;
+      var end = Math.min(start + size, u8.length);
+      if (id === 'VP8X') {
+        // VP8X 标志位：bit4(0x10) = Alpha，bit1(0x02) = Animation
+        if (size >= 1 && (u8[start] & 0x10)) hasAlpha = true;
+      } else if (id === 'ALPH') {
+        hasAlpha = true;
+        chunks.push({ id: id, bytes: u8.subarray(start, end) });
+      } else if (id === 'VP8 ' || id === 'VP8L') {
+        chunks.push({ id: id, bytes: u8.subarray(start, end) });
+      }
+      p = start + size + (size & 1);   // RIFF 块按偶数对齐
+    }
+    if (!chunks.length) throw new Error('WebP 里没有找到 VP8/VP8L 码流');
+    return { chunks: chunks, hasAlpha: hasAlpha };
+  }
+
+  /**
+   * 把若干「每张都是完整画面」的静帧 WebP 合成一张动图 WebP。
+   * frames: [{ data: Uint8Array(完整静帧 WebP 文件), duration: 毫秒 }]
+   */
+  function muxAnimatedWebp(frames, width, height) {
+    if (!frames || !frames.length) throw new Error('没有可用帧');
+    if (width < 1 || height < 1) throw new Error('画布尺寸无效');
+
+    var parsed = [];
+    var hasAlpha = false;
+    var i;
+    for (i = 0; i < frames.length; i++) {
+      var pr = parseStillWebp(frames[i].data);
+      if (pr.hasAlpha) hasAlpha = true;
+      parsed.push({ chunks: pr.chunks, duration: Math.max(20, Math.round(frames[i].duration) || 100) });
+    }
+
+    function anmfSize(f) {
+      var n = 16;                                   // ANMF 帧头固定 16 字节
+      for (var j = 0; j < f.chunks.length; j++) {
+        n += 8 + f.chunks[j].bytes.length;
+        if (f.chunks[j].bytes.length & 1) n += 1;   // 对齐填充
+      }
+      return n;
+    }
+
+    var total = 12 + (8 + 10) + (8 + 6);            // 文件头 + VP8X + ANIM
+    for (i = 0; i < parsed.length; i++) total += 8 + anmfSize(parsed[i]);
+
+    var out = new Uint8Array(total);
+    var o = 0;
+
+    o = wrId(out, o, 'RIFF');
+    wr32(out, o, total - 8); o += 4;
+    o = wrId(out, o, 'WEBP');
+
+    // VP8X：声明画布尺寸 + 动画标志（+ 有透明就带 Alpha 标志）
+    o = wrId(out, o, 'VP8X');
+    wr32(out, o, 10); o += 4;
+    out[o] = 0x02 | (hasAlpha ? 0x10 : 0x00); o += 1;
+    out[o] = 0; out[o + 1] = 0; out[o + 2] = 0; o += 3;
+    wr24(out, o, width - 1); o += 3;
+    wr24(out, o, height - 1); o += 3;
+
+    // ANIM：背景色 + 循环次数（0 = 无限）
+    o = wrId(out, o, 'ANIM');
+    wr32(out, o, 6); o += 4;
+    wr32(out, o, 0); o += 4;
+    wr16(out, o, 0); o += 2;
+
+    for (i = 0; i < parsed.length; i++) {
+      var f = parsed[i];
+      o = wrId(out, o, 'ANMF');
+      wr32(out, o, anmfSize(f)); o += 4;
+      wr24(out, o, 0); o += 3;                      // 帧左上角 X（单位 2px）
+      wr24(out, o, 0); o += 3;                      // 帧左上角 Y
+      wr24(out, o, width - 1); o += 3;
+      wr24(out, o, height - 1); o += 3;
+      wr24(out, o, f.duration); o += 3;
+      // 标志位：bit0 = 0 走 alpha 混合，bit1 = 1 显示完清除为背景。
+      // 每帧都是整幅画面，这样处理不会残留上一帧的鬼影。
+      out[o] = 0x02; o += 1;
+
+      for (var j = 0; j < f.chunks.length; j++) {
+        var c = f.chunks[j];
+        o = wrId(out, o, c.id);
+        wr32(out, o, c.bytes.length); o += 4;
+        out.set(c.bytes, o); o += c.bytes.length;
+        if (c.bytes.length & 1) { out[o] = 0; o += 1; }
+      }
+    }
+
+    return out;
+  }
+
+  // ---- 转换 ----
+
+  function fitSize(w, h, maxDim) {
+    var scale = Math.min(1, (maxDim || 640) / Math.max(w, h || 1));
+    return { w: Math.max(1, Math.round(w * scale)), h: Math.max(1, Math.round(h * scale)) };
+  }
+
+  function encodeWebp(canvas, quality) {
+    return canvasToBlob(canvas, WEBP_MIME, quality).then(function (b) {
+      if (!b || b.type !== WEBP_MIME) throw new Error('内核不支持 WebP 编码');
+      return b;
+    });
+  }
+
+  /** 只取首帧的静帧 WebP（到处都能跑） */
+  function gifToStaticWebp(blob, maxDim, quality) {
+    return blobToBitmap(blob).then(function (src) {
+      var w = src.width || src.naturalWidth || 0;
+      var h = src.height || src.naturalHeight || 0;
+      if (!w || !h) throw new Error('图片尺寸无效');
+      var s = fitSize(w, h, maxDim);
+      var c = document.createElement('canvas');
+      c.width = s.w; c.height = s.h;
+      c.getContext('2d').drawImage(src, 0, 0, s.w, s.h);
+      if (src.close) { try { src.close(); } catch (e) { /* ignore */ } }
+      return encodeWebp(c, quality).then(function (b) {
+        return { blob: b, filename: 'meme.webp', frames: 1, degraded: false };
+      });
+    });
+  }
+
+  /** 逐帧解码 + 重新封装成动图 WebP */
+  function gifToAnimatedWebp(blob, maxDim, quality) {
+    if (typeof ImageDecoder !== 'function') throw new Error('内核不支持 ImageDecoder');
+
+    return blob.arrayBuffer().then(function (buf) {
+      var dec = new ImageDecoder({ data: buf, type: 'image/gif' });
+
+      return Promise.resolve(dec.tracks.ready).then(function () {
+        var track = dec.tracks.selectedTrack;
+        var fc = track && track.frameCount;
+        return Promise.resolve(fc).then(function (count) {
+          count = Number(count) || 0;
+          if (count < 2) throw new Error('只有 ' + count + ' 帧，按静帧处理');
+          if (count > MAX_ANIM_FRAMES) throw new Error('帧数过多（' + count + '）');
+
+          // 先解一帧拿到尺寸
+          return dec.decode({ frameIndex: 0 }).then(function (r0) {
+            var f0 = r0.image;
+            var w = f0.displayWidth || f0.codedWidth || 0;
+            var h = f0.displayHeight || f0.codedHeight || 0;
+            if (f0.close) { try { f0.close(); } catch (e) { /* ignore */ } }
+            if (!w || !h) throw new Error('无法确定画布尺寸');
+
+            var s = fitSize(w, h, maxDim);
+            var frames = [];
+
+            // 串行解码：手机内存经不起并行堆几十张全尺寸帧
+            var seq = Promise.resolve();
+            for (var i = 0; i < count; i++) {
+              (function (idx) {
+                seq = seq.then(function () {
+                  return dec.decode({ frameIndex: idx }).then(function (res) {
+                    var img = res.image;
+                    var durUs = img.duration || 0;
+                    var c = document.createElement('canvas');
+                    c.width = s.w; c.height = s.h;
+                    c.getContext('2d').drawImage(img, 0, 0, s.w, s.h);
+                    if (img.close) { try { img.close(); } catch (e) { /* ignore */ } }
+                    return encodeWebp(c, quality).then(function (b) {
+                      return b.arrayBuffer();
+                    }).then(function (ab) {
+                      frames.push({
+                        data: new Uint8Array(ab),
+                        duration: Math.max(20, Math.round((durUs || 100000) / 1000))
+                      });
+                    });
+                  });
+                });
+              })(i);
+            }
+
+            return seq.then(function () {
+              var bytes = muxAnimatedWebp(frames, s.w, s.h);
+              return {
+                blob: new Blob([bytes], { type: WEBP_MIME }),
+                filename: 'meme.webp',
+                frames: frames.length,
+                degraded: false
+              };
+            });
+          });
+        });
+      });
+    });
+  }
+
+  /**
+   * 统一入口。mode: 'anim' | 'static'
+   * anim 不可用时降级为 static，并把 degraded 标记带出去，让调用方明确告知用户。
+   */
+  function convertToWebp(blob, mode, maxDim, quality) {
+    var wantAnim = (mode !== 'static');
+    if (wantAnim) {
+      return gifToAnimatedWebp(blob, maxDim, quality).catch(function (e) {
+        log('动图 WebP 不可用（' + e.message + '），降级为静态首帧');
+        return gifToStaticWebp(blob, maxDim, quality).then(function (r) {
+          r.degraded = true;
+          return r;
+        });
+      });
+    }
+    return gifToStaticWebp(blob, maxDim, quality);
+  }
+
+  /**
+   * 带体积约束的 GIF→WebP：只要「没变小」就降分辨率/降质量重来，最多 3 次，
+   * 最后交出试过的里面最小的那张。
+   *
+   * 为什么要拿原图大小当条件：动图 WebP 的每一帧都是整幅画面的**有损**编码，
+   * 而 GIF 每帧只存变化区域且带调色板压缩。实测同一张表情包，q=0.90 时产出
+   * 是原 GIF 的 1.5~2 倍；q≈0.70 才稳定压到 0.5~0.85 倍。所以必须允许降质重试，
+   * 否则这个功能会几乎每次都因为「变大」而放弃转换。
+   */
+  function convertToWebpFitted(blob, mode, maxDim, quality, maxBytes) {
+    var dim = maxDim;
+    var q = quality;
+    var best = null;
+    var tries = 0;
+
+    function once() {
+      return convertToWebp(blob, mode, dim, q).then(function (r) {
+        if (!best || r.blob.size < best.blob.size) best = r;
+        tries++;
+        var tooBig = (maxBytes && r.blob.size > maxBytes) || r.blob.size >= blob.size;
+        if (!tooBig || tries >= 3) return best;
+        dim = Math.max(160, Math.round(dim * 0.8));
+        q = Math.max(0.5, q - 0.12);
+        log('WebP 没比原图小（' + bytesText(r.blob.size) + ' vs ' + bytesText(blob.size) +
+          '），降到 ' + dim + 'px / q=' + q.toFixed(2) + ' 重试');
+        return once();
+      });
+    }
+
+    return once();
+  }
+
+  /* =========================================================================
    * 8. 上传链（严格复刻 uploadFileDirect.y）
    *    POST /api/upload/presign  →  PUT upload_url  →  POST /api/upload/bind
    * =======================================================================*/
@@ -706,71 +1118,80 @@
   }
 
   function uploadImage(blob, filename, roomId, onProgress) {
-    var contentType = blob.type || mimeFromName(filename) || 'image/jpeg';
-    if (contentType === 'application/octet-stream') contentType = mimeFromName(filename);
-    var ext = extFromName(filename, contentType);
-    var size = blob.size;
-    if (!size || size < 1) return Promise.reject(new Error('文件大小无效'));
+    if (!blob || !blob.size || blob.size < 1) return Promise.reject(new Error('文件大小无效'));
 
-    var form = new URLSearchParams();
-    form.set('upload_source', 'chat_image');
-    form.set('content_type', contentType);
-    form.set('bytes', String(size));
-    form.set('ext', ext);
-    if (roomId) form.set('room_id', roomId);
+    // 以字节为准决定 content_type / ext，绝不把 CDN 给的非标准值（如 image/jpg）透传给服务端
+    return resolveUploadFormat(blob, filename).then(function (fmt) {
+      var contentType = fmt.mime;
+      var ext = fmt.ext;
+      var size = blob.size;
 
-    if (onProgress) onProgress(0.02);
-    log('presign', { content_type: contentType, bytes: size, ext: ext, room_id: roomId });
+      if (!fmt.sniffed) log('未能从文件头识别格式，按声明值处理', { declared: fmt.declared, mime: contentType });
 
-    return apiJson('POST', '/api/upload/presign', form.toString(),
-      { 'Content-Type': 'application/x-www-form-urlencoded' })
-      .then(function (cred) {
-        if (!cred || !cred.ticket_id || !cred.upload_url) throw new Error('上传凭证无效');
-        if (Number(cred.content_length) !== size) throw new Error('上传大小不一致，请重新选择图片');
-        if (onProgress) onProgress(0.08);
+      var form = new URLSearchParams();
+      form.set('upload_source', 'chat_image');
+      form.set('content_type', contentType);
+      form.set('bytes', String(size));
+      form.set('ext', ext);
+      if (roomId) form.set('room_id', roomId);
 
-        var headers = {};
-        var src = cred.headers || {};
-        for (var k in src) { if (Object.prototype.hasOwnProperty.call(src, k)) headers[k] = src[k]; }
-        var ct = src['Content-Type'] || src['content-type'] || contentType;
-        headers['Content-Type'] = ct;
+      if (onProgress) onProgress(0.02);
+      log('presign', { content_type: contentType, bytes: size, ext: ext, room_id: roomId });
 
-        return putRaw(cred.upload_url, blob, headers, function (p) {
-          if (onProgress) onProgress(0.08 + p * 0.8);
-        }).then(function () {
-          if (onProgress) onProgress(0.9);
-          var bf = new URLSearchParams();
-          bf.set('ticket_id', String(cred.ticket_id));
-          return apiJson('POST', '/api/upload/bind', bf.toString(),
-            { 'Content-Type': 'application/x-www-form-urlencoded' });
-        }).then(function (bound) {
-          var finalUrl = String((bound && bound.url) || '');
-          if (!finalUrl) throw new Error('上传校验失败');
-          if (onProgress) onProgress(1);
-          return {
-            url: finalUrl,
-            upload_file_id: bound.upload_file_id,
-            ticket_id: bound.ticket_id || cred.ticket_id,
-            file_size: bound.file_size,
-            mime_type: bound.mime_type
-          };
+      return apiJson('POST', '/api/upload/presign', form.toString(),
+        { 'Content-Type': 'application/x-www-form-urlencoded' })
+        .then(function (cred) {
+          if (!cred || !cred.ticket_id || !cred.upload_url) throw new Error('上传凭证无效');
+          if (Number(cred.content_length) !== size) throw new Error('上传大小不一致，请重新选择图片');
+          if (onProgress) onProgress(0.08);
+
+          var headers = {};
+          var src = cred.headers || {};
+          for (var k in src) { if (Object.prototype.hasOwnProperty.call(src, k)) headers[k] = src[k]; }
+          var ct = src['Content-Type'] || src['content-type'] || contentType;
+          headers['Content-Type'] = ct;
+
+          return putRaw(cred.upload_url, blob, headers, function (p) {
+            if (onProgress) onProgress(0.08 + p * 0.8);
+          }).then(function () {
+            if (onProgress) onProgress(0.9);
+            var bf = new URLSearchParams();
+            bf.set('ticket_id', String(cred.ticket_id));
+            return apiJson('POST', '/api/upload/bind', bf.toString(),
+              { 'Content-Type': 'application/x-www-form-urlencoded' });
+          }).then(function (bound) {
+            var finalUrl = String((bound && bound.url) || '');
+            if (!finalUrl) throw new Error('上传校验失败');
+            if (onProgress) onProgress(1);
+            return {
+              url: finalUrl,
+              upload_file_id: bound.upload_file_id,
+              ticket_id: bound.ticket_id || cred.ticket_id,
+              file_size: bound.file_size,
+              mime_type: bound.mime_type
+            };
+          });
+        })
+        .catch(function (e) {
+          var payload = e && e.payload;
+          var code = String((payload && (payload.err_code || payload.error)) || '');
+          var msg = String((payload && payload.msg) || (e && e.message) || '上传失败');
+          if (code === 'file_too_large' || /超过|过大|too.?large/i.test(msg)) {
+            var err = new Error(msg || '图片过大'); err.reason = 'too_large'; throw err;
+          }
+          if (code === 'unsupported_type' || /不支持|格式/.test(msg)) {
+            var e2 = new Error(msg || '格式不支持');
+            e2.reason = 'unsupported';
+            e2.mime = contentType;
+            e2.ext = ext;
+            throw e2;
+          }
+          if (code === 'bind_failed' || /校验/.test(msg)) {
+            var e3 = new Error(msg || '上传校验失败'); e3.reason = 'bind_failed'; throw e3;
+          }
+          throw e;
         });
-      })
-      .catch(function (e) {
-        var payload = e && e.payload;
-        var code = String((payload && (payload.err_code || payload.error)) || '');
-        var msg = String((payload && payload.msg) || (e && e.message) || '上传失败');
-        if (code === 'file_too_large' || /超过|过大|too.?large/i.test(msg)) {
-          var err = new Error(msg || '图片过大'); err.reason = 'too_large'; throw err;
-        }
-        if (code === 'unsupported_type' || /不支持|格式/.test(msg)) {
-          var e2 = new Error(msg || '格式不支持'); e2.reason = 'unsupported'; throw e2;
-        }
-        if (code === 'bind_failed' || /校验/.test(msg)) {
-          var e3 = new Error(msg || '上传校验失败'); e3.reason = 'bind_failed'; throw e3;
-        }
-        throw e;
-      });
+    });
   }
 
   /* =========================================================================
@@ -1044,6 +1465,8 @@
     '.sw input[type=checkbox]::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;',
     '  border-radius:50%;background:#fff;transition:transform .18s;}',
     '.sw input[type=checkbox]:checked::after{transform:translateX(17px);}',
+    '.sw select{height:28px;max-width:56%;border-radius:8px;border:1px solid var(--line);background:var(--bg2);',
+    '  color:var(--fg);font-size:12px;padding:0 6px;outline:none;}',
     '.hint{font-size:11px;color:var(--fg2);margin-top:4px;line-height:1.45;}',
     '.logbox{width:100%;height:130px;overflow:auto;background:var(--bg2);border:1px solid var(--line);',
     '  border-radius:8px;padding:6px 8px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;',
@@ -1158,6 +1581,18 @@
       '        <div class="sw"><span>自动压缩超限图片</span><input type="checkbox" data-k="autoCompress"></div>',
       '        <div class="sw"><span>超过此大小(MB)开始压缩</span><input type="number" data-k="compressOverMB" min="1" max="20" step="0.5" style="width:84px"></div>',
       '        <div class="sw"><span>最长边(px)</span><input type="number" data-k="maxDimension" min="320" max="4096" step="80" style="width:84px"></div>',
+      '      </div>',
+      '      <div class="f"><label>GIF → WebP</label>',
+      '        <div class="sw"><span>转换模式</span>',
+      '          <select data-k="gifToWebp">',
+      '            <option value="anim">动图 WebP（保留动画）</option>',
+      '            <option value="static">静态 WebP（只留首帧）</option>',
+      '            <option value="off">关闭，原样发送 GIF</option>',
+      '          </select></div>',
+      '        <div class="sw"><span>最长边(px)</span><input type="number" data-k="webpMaxDim" min="160" max="2048" step="80" style="width:84px"></div>',
+      '        <div class="sw"><span>质量 (0.5–1)</span><input type="number" data-k="webpQuality" min="0.5" max="1" step="0.05" style="width:84px"></div>',
+      '        <div class="hint">动图 WebP 依赖内核的 ImageDecoder 逐帧解码（Chrome / 安卓 WebView 94+），逐帧重新编码后自封装成动图容器。内核不支持时会自动降级为静态首帧并明确提示，不会闷声丢动画。',
+      '          质量默认 0.70：实测 q=0.9 时产出反而是原 GIF 的 1.5~2 倍（GIF 每帧只存变化区域，WebP 每帧是整幅有损编码），q≈0.7 才稳定压到 0.5~0.85 倍。转换后若没比原图小会自动降质重试，最终还是不小就直接发原 GIF。</div>',
       '      </div>',
       '      <div class="f"><label>交互</label>',
       '        <div class="sw"><span>点击表情直接发送（不弹确认）</span><input type="checkbox" data-k="skipConfirm"></div>',
@@ -1559,28 +1994,72 @@
   function doSearch(page) {
     var kw = String(ui.els.input.value || '').trim();
     if (!kw) { toast('请输入关键词'); return; }
-    var src = getSource(state.sourceId);
-    if (!src) { toast('没有可用的表情源，请到设置里配置', 'error'); return; }
+    var list = activeSources();
+    if (!list.length) { toast('没有可用的表情源，请到设置里配置', 'error'); return; }
     if (state.busy) return;
+
+    var primary = getSource(state.sourceId) || list[0];
+    // 选中的源排最前，其余启用源作为备用 —— 失败或返回空时依次顶上
+    var order = [primary];
+    for (var q = 0; q < list.length; q++) {
+      if (list[q].id !== primary.id) order.push(list[q]);
+    }
+
     state.busy = true;
     state.query = kw;
     state.page = page || 1;
     state.selected = null;
     ui.els.send.disabled = true;
     ui.els.grid.innerHTML = '<div class="empty">搜索中…</div>';
-    setStatus('正在从「' + (src.name || src.id) + '」搜索：' + kw + '（第 ' + state.page + ' 页）');
+    setStatus('正在从「' + (primary.name || primary.id) + '」搜索：' + kw + '（第 ' + state.page + ' 页）');
 
-    searchSource(src, kw, state.page).then(function (urls) {
-      state.results = urls;
-      renderResults(urls);
-      setStatus(urls.length ? ('「' + src.name + '」第 ' + state.page + ' 页 · ' + urls.length + ' 张（点击选择）')
-        : '没有搜索结果');
+    var tried = [];
+
+    function attempt(i) {
+      var src = order[i];
+      var name = src.name || src.id;
+      return searchSource(src, kw, state.page).then(function (urls) {
+        if (urls && urls.length) return { src: src, urls: urls };
+        tried.push(name + '（无结果）');
+        if (i + 1 < order.length) {
+          log('「' + name + '」没有结果，改用「' + (order[i + 1].name || order[i + 1].id) + '」');
+          setStatus('「' + name + '」无结果，正在尝试备用源…');
+          return attempt(i + 1);
+        }
+        return { src: src, urls: [] };
+      }, function (err) {
+        tried.push(name + '（' + err.message + '）');
+        if (i + 1 < order.length) {
+          log('「' + name + '」失败：' + err.message + '，改用「' + (order[i + 1].name || order[i + 1].id) + '」');
+          setStatus('「' + name + '」失败，正在尝试备用源…');
+          return attempt(i + 1);
+        }
+        throw new Error(tried.join('；') || err.message);
+      });
+    }
+
+    attempt(0).then(function (r) {
+      state.results = r.urls;
+      if (r.urls.length) {
+        // 记住真正出结果的源，这样「换一批」不用再走一遍失败流程
+        state.sourceId = r.src.id;
+        if (ui.els.sourceSel) ui.els.sourceSel.value = r.src.id;
+      }
+      renderResults(r.urls);
+      var name = r.src.name || r.src.id;
+      if (r.urls.length) {
+        setStatus('「' + name + '」第 ' + state.page + ' 页 · ' + r.urls.length + ' 张（点击选择）');
+        if (tried.length) toast('已自动切换到「' + name + '」', 'warn');
+      } else {
+        setStatus('没有搜索结果');
+        ui.els.grid.innerHTML = '<div class="empty">没有搜索结果，换个关键词或换个源试试</div>';
+      }
       ui.els.info.textContent = '就绪';
     }).catch(function (e) {
       state.results = [];
       ui.els.grid.innerHTML = '<div class="empty">搜索失败：' + esc(e.message) + '</div>';
       setStatus('搜索失败：' + e.message);
-      toast('搜索失败：' + e.message, 'error');
+      toast('所有表情源都失败了', 'error');
     }).then(function () {
       state.busy = false;
     });
@@ -1653,9 +2132,42 @@
         });
       })
       .then(function (got) {
+        // —— GIF → WebP ——
+        var mode = settings.gifToWebp;
+        if (!mode || mode === 'off') return got;
+        if (!isGif(got.blob.type, got.filename)) return got;
+        if (!canEncodeWebp()) {
+          log('内核不支持 WebP 编码，保持原 GIF');
+          return got;
+        }
+        var over = settings.compressOverMB * 1024 * 1024;
+        setStatus('GIF → WebP 转换中…');
+        setProgress(0.62);
+        return convertToWebpFitted(
+          got.blob, mode, settings.webpMaxDim, settings.webpQuality,
+          settings.autoCompress ? over : 0
+        ).then(function (r) {
+          log('GIF→WebP：' + (r.frames > 1 ? r.frames + ' 帧动图' : '静帧') +
+            ' ' + bytesText(got.blob.size) + ' → ' + bytesText(r.blob.size) +
+            (r.degraded ? '（内核不支持动图，已降级为静态首帧）' : ''));
+          if (r.degraded) toast('内核不支持动图 WebP，已按静态首帧转换', 'warn');
+          if (r.blob.size >= got.blob.size) {
+            log('转换后反而更大（' + bytesText(r.blob.size) + '），保留原 GIF');
+            return got;
+          }
+          // 留着原图：万一服务端不接受 webp，还能原样发出去
+          return { blob: r.blob, filename: r.filename, fromGif: true, fallback: got };
+        }).catch(function (e) {
+          log('GIF→WebP 失败，保留原 GIF：' + e.message);
+          return got;
+        });
+      })
+      .then(function (got) {
         var over = settings.compressOverMB * 1024 * 1024;
         var isGifFile = isGif(got.blob.type, got.filename);
-        if (settings.autoCompress && got.blob.size > over && !isGifFile) {
+        // WebP 不参与 JPEG 压缩：那会把动图压成静态图，等于白转
+        var isWebpFile = (got.blob.type === WEBP_MIME);
+        if (settings.autoCompress && got.blob.size > over && !isGifFile && !isWebpFile) {
           setStatus('压缩图片（' + bytesText(got.blob.size) + '）…');
           setProgress(0.72);
           return compressBlob(got.blob, over, settings.maxDimension).then(function (c) {
@@ -1675,10 +2187,31 @@
         return uploadImage(got.blob, got.filename, roomId, function (p) {
           setProgress(0.78 + p * 0.18);
         }).catch(function (e) {
+          var isWebpFile = (got.blob.type === WEBP_MIME);
+
+          // 服务端不接受 webp（扩展名白名单/iOS 兼容之类）→ 原样回退发原图，别让用户白等
+          if (e.reason === 'unsupported' && got.fallback) {
+            log('服务端不接受 WebP（' + e.message + '），回退发送原图');
+            toast('服务端不支持 WebP，已改发原图', 'warn');
+            setStatus('服务端不支持 WebP，改发原图…');
+            var fb = got.fallback;
+            return uploadImage(fb.blob, fb.filename, roomId, function (p) {
+              setProgress(0.78 + p * 0.18);
+            });
+          }
+
           if (e.reason === 'too_large' && settings.autoCompress && !isGif(got.blob.type, got.filename)) {
             setStatus('服务端提示过大，正在压缩重试…');
-            return compressBlob(got.blob, 1024 * 1024, settings.maxDimension).then(function (c) {
-              c.filename = ensureExt('meme.jpg', c.blob.type);
+            // WebP 走「降分辨率重转」，别用 JPEG 压，否则动图会变静态
+            var retry = isWebpFile
+              ? convertToWebpFitted(got.blob, settings.gifToWebp, Math.max(160, Math.round(settings.webpMaxDim * 0.6)),
+                Math.max(0.5, settings.webpQuality - 0.15), 1024 * 1024)
+              : compressBlob(got.blob, 1024 * 1024, settings.maxDimension).then(function (c) {
+                c.filename = ensureExt('meme.jpg', c.blob.type);
+                return c;
+              });
+            return retry.then(function (c) {
+              if (c.blob && c.blob.type === WEBP_MIME) c.filename = 'meme.webp';
               return uploadImage(c.blob, c.filename, roomId, function (p) {
                 setProgress(0.78 + p * 0.18);
               });
